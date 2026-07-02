@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import random
-import aiosqlite
+import sqlite3
 import os
 import tempfile
 import traceback
@@ -35,10 +35,7 @@ DB_NAME = "faceit.db"
 MAPS = ["Dune", "Province", "Sandstone", "Hanami", "Rust", "Prison", "Breeze",
         "Bridge", "Pool", "Cableway", "Pipeline", "Village", "Arena"]
 
-# ⚠️ Для карт 1x1 (Bridge, Pool, Cableway, Pipeline, Village, Arena)
-# замените ссылки на реальные скриншоты. Сейчас используются заглушки.
 MAP_IMAGES = {
-    # 5x5 и 2x2
     "Dune": "https://i.ibb.co/qYRzXhvH/dune.png",
     "Province": "https://i.ibb.co/rfm56cRm/province.png",
     "Sandstone": "https://i.ibb.co/5W8tW0D1/sandstone.png",
@@ -46,83 +43,118 @@ MAP_IMAGES = {
     "Rust": "https://i.ibb.co/gLyjnXQ8/rust.png",
     "Prison": "https://i.ibb.co/QF6ZL1ww/prison.png",
     "Breeze": "https://i.ibb.co/7J66n9dN/breeze.png",
-
-    # 1x1 – замените на свои скриншоты
-    "Bridge":   "https://i.ibb.co/qYRzXhvH/dune.png",   # ← нужно заменить
-    "Pool":     "https://i.ibb.co/rfm56cRm/province.png", # ← нужно заменить
-    "Cableway": "https://i.ibb.co/5W8tW0D1/sandstone.png", # ← нужно заменить
-    "Pipeline": "https://i.ibb.co/Y7zNwp6r/hanami.png",  # ← нужно заменить
-    "Village":  "https://i.ibb.co/gLyjnXQ8/rust.png",     # ← нужно заменить
-    "Arena":    "https://i.ibb.co/7J66n9dN/breeze.png"    # ← нужно заменить
+    "Bridge": "https://i.ibb.co/qYRzXhvH/dune.png",
+    "Pool": "https://i.ibb.co/rfm56cRm/province.png",
+    "Cableway": "https://i.ibb.co/5W8tW0D1/sandstone.png",
+    "Pipeline": "https://i.ibb.co/Y7zNwp6r/hanami.png",
+    "Village": "https://i.ibb.co/gLyjnXQ8/rust.png",
+    "Arena": "https://i.ibb.co/7J66n9dN/breeze.png"
 }
 
-# ==================== БАЗА ДАННЫХ ====================
-async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.executescript("""
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                nickname TEXT,
-                game_id TEXT,
-                elo INTEGER DEFAULT 1000
-            );
-            CREATE TABLE IF NOT EXISTS admins (
-                user_id INTEGER PRIMARY KEY,
-                role TEXT DEFAULT 'admin'
-            );
-            CREATE TABLE IF NOT EXISTS bans (
-                user_id INTEGER PRIMARY KEY,
-                reason TEXT,
-                banned_until TEXT
-            );
-            CREATE TABLE IF NOT EXISTS lobbies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                host_id INTEGER,
-                format TEXT,
-                map TEXT,
-                status TEXT DEFAULT 'open',
-                message_id INTEGER,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS lobby_players (
-                lobby_id INTEGER,
-                user_id INTEGER,
-                team INTEGER DEFAULT 0,
-                PRIMARY KEY (lobby_id, user_id)
-            );
-            CREATE TABLE IF NOT EXISTS tickets (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                type TEXT,
-                content TEXT,
-                status TEXT DEFAULT 'open',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE TABLE IF NOT EXISTS matches (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lobby_id INTEGER,
-                result_data TEXT,
-                screenshot_id TEXT,
-                played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        for col, col_def in [
-            ("premium", "INTEGER DEFAULT 0"),
-            ("verified", "INTEGER DEFAULT 0"),
-            ("frame", "TEXT DEFAULT ''"),
-            ("banner", "TEXT DEFAULT ''"),
-            ("color_nick", "TEXT DEFAULT ''"),
-            ("matches_played", "INTEGER DEFAULT 0"),
-            ("kills", "INTEGER DEFAULT 0"),
-            ("deaths", "INTEGER DEFAULT 0"),
-            ("avatar_path", "TEXT DEFAULT ''"),
-            ("avatar_file_id", "TEXT DEFAULT ''")
-        ]:
-            try:
-                await db.execute(f"ALTER TABLE users ADD COLUMN {col} {col_def}")
-            except:
-                pass
-        await db.commit()
+# ==================== БАЗА ДАННЫХ (sqlite3) ====================
+def _get_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def init_db():
+    conn = _get_conn()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            nickname TEXT,
+            game_id TEXT,
+            elo INTEGER DEFAULT 1000,
+            can_create_lobby INTEGER DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            role TEXT DEFAULT 'admin'
+        );
+        CREATE TABLE IF NOT EXISTS bans (
+            user_id INTEGER PRIMARY KEY,
+            reason TEXT,
+            banned_until TEXT
+        );
+        CREATE TABLE IF NOT EXISTS lobbies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            host_id INTEGER,
+            format TEXT,
+            map TEXT,
+            status TEXT DEFAULT 'open',
+            message_id INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            teams_swapped INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS lobby_players (
+            lobby_id INTEGER,
+            user_id INTEGER,
+            team INTEGER DEFAULT 0,
+            PRIMARY KEY (lobby_id, user_id)
+        );
+        CREATE TABLE IF NOT EXISTS tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            type TEXT,
+            content TEXT,
+            status TEXT DEFAULT 'open',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lobby_id INTEGER,
+            host_id INTEGER,
+            map TEXT,
+            ct_score INTEGER,
+            t_score INTEGER,
+            teams_swapped INTEGER DEFAULT 0,
+            screenshot_id TEXT,
+            played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    for col, col_def in [
+        ("premium", "INTEGER DEFAULT 0"),
+        ("verified", "INTEGER DEFAULT 0"),
+        ("frame", "TEXT DEFAULT ''"),
+        ("banner", "TEXT DEFAULT ''"),
+        ("color_nick", "TEXT DEFAULT ''"),
+        ("matches_played", "INTEGER DEFAULT 0"),
+        ("kills", "INTEGER DEFAULT 0"),
+        ("deaths", "INTEGER DEFAULT 0"),
+        ("avatar_path", "TEXT DEFAULT ''"),
+        ("avatar_file_id", "TEXT DEFAULT '')
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass
+    conn.commit()
+    conn.close()
+
+async def db_execute(sql: str, params: tuple = ()):
+    def _exec():
+        conn = _get_conn()
+        conn.execute(sql, params)
+        conn.commit()
+        conn.close()
+    await asyncio.to_thread(_exec)
+
+async def db_fetchone(sql: str, params: tuple = ()) -> dict | None:
+    def _fetch():
+        conn = _get_conn()
+        row = conn.execute(sql, params).fetchone()
+        conn.close()
+        return dict(row) if row else None
+    return await asyncio.to_thread(_fetch)
+
+async def db_fetchall(sql: str, params: tuple = ()) -> list:
+    def _fetch():
+        conn = _get_conn()
+        rows = conn.execute(sql, params).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+    return await asyncio.to_thread(_fetch)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 async def check_subscription(bot: Bot, user_id: int) -> bool:
@@ -133,101 +165,73 @@ async def check_subscription(bot: Bot, user_id: int) -> bool:
         return False
 
 async def get_elo_rank(user_id: int) -> tuple:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT elo FROM users WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        if not row:
-            return 0, 0
-        elo = row[0]
-        cursor = await db.execute("SELECT COUNT(*) FROM users WHERE elo > ?", (elo,))
-        better = await cursor.fetchone()
-        rank = better[0] + 1
-        return elo, rank
+    row = await db_fetchone("SELECT elo FROM users WHERE user_id = ?", (user_id,))
+    if not row:
+        return 0, 0
+    elo = row['elo']
+    cnt = await db_fetchone("SELECT COUNT(*) as cnt FROM users WHERE elo > ?", (elo,))
+    return elo, cnt['cnt'] + 1
 
 async def is_admin(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT role FROM admins WHERE user_id = ?", (user_id,))
-        return await cursor.fetchone() is not None
+    return await db_fetchone("SELECT role FROM admins WHERE user_id = ?", (user_id,)) is not None
 
 async def is_leader(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT role FROM admins WHERE user_id = ? AND role = 'leader'", (user_id,))
-        return await cursor.fetchone() is not None
+    row = await db_fetchone("SELECT role FROM admins WHERE user_id = ? AND role = 'leader'", (user_id,))
+    return row is not None
 
 async def is_banned(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT banned_until FROM bans WHERE user_id = ?", (user_id,))
-        row = await cursor.fetchone()
-        if not row:
-            return False
-        banned_until = row[0]
-        if banned_until == "permanent":
+    row = await db_fetchone("SELECT banned_until FROM bans WHERE user_id = ?", (user_id,))
+    if not row:
+        return False
+    banned_until = row['banned_until']
+    if banned_until == "permanent":
+        return True
+    try:
+        until = datetime.fromisoformat(banned_until)
+        if until > datetime.now():
             return True
-        try:
-            until = datetime.fromisoformat(banned_until)
-            if until > datetime.now():
-                return True
-            else:
-                await db.execute("DELETE FROM bans WHERE user_id = ?", (user_id,))
-                await db.commit()
-                return False
-        except:
+        else:
+            await db_execute("DELETE FROM bans WHERE user_id = ?", (user_id,))
             return False
+    except:
+        return False
+
+async def can_create_lobby(user_id: int) -> bool:
+    row = await db_fetchone("SELECT can_create_lobby FROM users WHERE user_id = ?", (user_id,))
+    return row and row['can_create_lobby'] == 1
 
 async def get_admin_ids() -> list:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT user_id FROM admins")
-        return [row[0] for row in await cursor.fetchall()]
+    rows = await db_fetchall("SELECT user_id FROM admins")
+    return [r['user_id'] for r in rows]
 
 async def db_get_account(user_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT nickname, game_id FROM users WHERE user_id=?", (user_id,))
-        row = await cursor.fetchone()
-        if row:
-            return {"nickname": row[0], "game_id": row[1]}
-        return None
+    return await db_fetchone("SELECT nickname, game_id FROM users WHERE user_id=?", (user_id,))
 
 async def db_get_player(user_id: int) -> dict | None:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT elo, kills, deaths, matches_played, premium, verified FROM users WHERE user_id=?", (user_id,))
-        row = await cursor.fetchone()
-        if row:
-            return {
-                "elo": row[0], "kills": row[1], "deaths": row[2],
-                "matches_played": row[3], "premium": row[4], "verified": row[5],
-                "wins": 0, "losses": 0
-            }
-        return None
+    return await db_fetchone("SELECT elo, kills, deaths, matches_played, premium, verified FROM users WHERE user_id=?", (user_id,))
 
 async def is_premium(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT premium FROM users WHERE user_id=?", (user_id,))
-        row = await cursor.fetchone()
-        return row[0] == 1 if row else False
+    row = await db_fetchone("SELECT premium FROM users WHERE user_id=?", (user_id,))
+    return row and row['premium'] == 1
 
 async def is_verified(user_id: int) -> bool:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT verified FROM users WHERE user_id=?", (user_id,))
-        row = await cursor.fetchone()
-        return row[0] == 1 if row else False
+    row = await db_fetchone("SELECT verified FROM users WHERE user_id=?", (user_id,))
+    return row and row['verified'] == 1
 
 async def find_user_by_nickname(nickname: str) -> int | None:
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT user_id FROM users WHERE nickname=?", (nickname,))
-        row = await cursor.fetchone()
-        return row[0] if row else None
+    row = await db_fetchone("SELECT user_id FROM users WHERE nickname=?", (nickname,))
+    return row['user_id'] if row else None
 
 def get_level(elo: int) -> int:
     return max(1, elo // 200)
 
 # ==================== PLAYWRIGHT РЕНДЕРИНГ ====================
 async def html_to_image(html: str) -> Image.Image:
-    """Рендерит HTML в PNG через Playwright."""
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page(viewport={"width": 1200, "height": 800})
         await page.set_content(html)
-        await page.wait_for_timeout(2000)  # ждём загрузки Tailwind
+        await page.wait_for_timeout(2000)
         screenshot = await page.screenshot(full_page=True)
         await browser.close()
         return Image.open(BytesIO(screenshot)).convert("RGB")
@@ -447,14 +451,17 @@ class TicketAdminStates(StatesGroup):
     photo = State()
 
 class ResultStates(StatesGroup):
+    waiting_lobby_id = State()
     waiting_screenshot = State()
-    entering_results = State()
+    waiting_score = State()
+    confirm_swap = State()
 
 class AdminNickInput(StatesGroup): waiting_nickname = State()
 class AdminReasonInput(StatesGroup): waiting_reason = State()
 class AdminDurationInput(StatesGroup): waiting_duration = State()
 class AdminTicketReview(StatesGroup): waiting_ticket_id = State()
 class AdminTestShuffle(StatesGroup): waiting_lobby_id = State()
+class AdminLobbyBan(StatesGroup): waiting_nickname = State()
 class AvatarUpload(StatesGroup): waiting_photo = State()
 
 # ==================== КЛАВИАТУРЫ ====================
@@ -477,10 +484,12 @@ def admin_panel_keyboard():
         [InlineKeyboardButton(text="4. Забрать верификацию", callback_data="admin_remove_verify")],
         [InlineKeyboardButton(text="5. Забанить", callback_data="admin_ban")],
         [InlineKeyboardButton(text="6. Разбанить", callback_data="admin_unban")],
-        [InlineKeyboardButton(text="7. Тестовая жеребьёвка", callback_data="admin_test_shuffle")],
-        [InlineKeyboardButton(text="8. Рассмотреть тикет", callback_data="admin_review_ticket")],
-        [InlineKeyboardButton(text="9. Выдать админку", callback_data="admin_add_admin")],
-        [InlineKeyboardButton(text="10. Забрать админку", callback_data="admin_remove_admin")],
+        [InlineKeyboardButton(text="7. Запрет создания лобби", callback_data="admin_lobby_ban")],
+        [InlineKeyboardButton(text="8. Разрешить создание лобби", callback_data="admin_lobby_unban")],
+        [InlineKeyboardButton(text="9. Тестовая жеребьёвка", callback_data="admin_test_shuffle")],
+        [InlineKeyboardButton(text="10. Рассмотреть тикет", callback_data="admin_review_ticket")],
+        [InlineKeyboardButton(text="11. Выдать админку", callback_data="admin_add_admin")],
+        [InlineKeyboardButton(text="12. Забрать админку", callback_data="admin_remove_admin")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
     ])
 
@@ -491,14 +500,11 @@ dp = Dispatcher(storage=MemoryStorage())
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     if message.from_user.username and message.from_user.username.lower() == LEADER_USERNAME.lower():
-        async with aiosqlite.connect(DB_NAME) as db:
-            await db.execute("INSERT OR REPLACE INTO admins VALUES (?, 'leader')", (user_id,))
-            await db.commit()
+        await db_execute("INSERT OR REPLACE INTO admins VALUES (?, 'leader')", (user_id,))
     if await is_banned(user_id):
         await message.answer("Вы забанены."); return
-    async with aiosqlite.connect(DB_NAME) as db:
-        if await db.execute("SELECT nickname FROM users WHERE user_id=?", (user_id,)).fetchone():
-            await message.answer("✊ Добро пожаловать обратно!", reply_markup=main_keyboard()); return
+    if await db_fetchone("SELECT nickname FROM users WHERE user_id=?", (user_id,)):
+        await message.answer("✊ Добро пожаловать обратно!", reply_markup=main_keyboard()); return
     if not await check_subscription(bot, user_id):
         await message.answer("Для доступа подпишитесь на @testhp404bot", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Подписаться", url=f"https://t.me/{CHANNEL_USERNAME[1:]}")],
@@ -536,9 +542,7 @@ async def reg_game_id(message: Message, state: FSMContext):
 @dp.callback_query(RegStates.confirm, F.data == "confirm_reg")
 async def reg_confirm(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,1000)", (callback.from_user.id, data['nickname'], data['game_id']))
-        await db.commit()
+    await db_execute("INSERT OR REPLACE INTO users VALUES (?,?,?,1000)", (callback.from_user.id, data['nickname'], data['game_id']))
     await callback.message.delete(); await callback.message.answer("✅ Регистрация завершена!", reply_markup=main_keyboard())
     await state.clear()
 
@@ -571,9 +575,7 @@ async def set_avatar_start(message: Message, state: FSMContext):
 @dp.message(AvatarUpload.waiting_photo, F.photo)
 async def avatar_photo_handler(message: Message, state: FSMContext):
     file_id = message.photo[-1].file_id
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET avatar_file_id=? WHERE user_id=?", (file_id, message.from_user.id))
-        await db.commit()
+    await db_execute("UPDATE users SET avatar_file_id=? WHERE user_id=?", (file_id, message.from_user.id))
     await message.answer("✅ Аватар обновлён!", reply_markup=main_keyboard())
     await state.clear()
 
@@ -584,6 +586,8 @@ async def avatar_not_photo(message: Message):
 # --- ЛОББИ ---
 @dp.message(F.text == "➕ Создать матч")
 async def create_match(message: Message, state: FSMContext):
+    if not await can_create_lobby(message.from_user.id):
+        await message.answer("⛔ Вам запрещено создавать лобби."); return
     await message.answer("Выбери формат:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="5x5", callback_data="format_5x5")],
         [InlineKeyboardButton(text="2x2", callback_data="format_2x2")],
@@ -619,11 +623,15 @@ async def lobby_created(callback: CallbackQuery, state: FSMContext, bot: Bot):
     data = await state.get_data()
     fmt, map_name = data['format'], data['map']
     host_id = callback.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("INSERT INTO lobbies (host_id, format, map) VALUES (?,?,?)", (host_id, fmt, map_name))
+    def _create():
+        conn = _get_conn()
+        cur = conn.execute("INSERT INTO lobbies (host_id, format, map) VALUES (?,?,?)", (host_id, fmt, map_name))
         lid = cur.lastrowid
-        await db.execute("INSERT INTO lobby_players VALUES (?,?,0)", (lid, host_id))
-        await db.commit()
+        conn.execute("INSERT INTO lobby_players VALUES (?,?,0)", (lid, host_id))
+        conn.commit()
+        conn.close()
+        return lid
+    lid = await asyncio.to_thread(_create)
     await update_lobby_image(bot, lid)
     await callback.message.delete()
     await callback.message.answer(f"✅ Лобби #{lid} создано!", reply_markup=main_keyboard())
@@ -635,48 +643,42 @@ async def cancel_lobby(callback: CallbackQuery, state: FSMContext):
     await state.clear()
 
 async def update_lobby_image(bot: Bot, lobby_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT message_id, format, map, host_id FROM lobbies WHERE id=?", (lobby_id,))
-        lobby = await cur.fetchone()
-        if not lobby: return
-        msg_id, fmt, map_name, host_id = lobby
-        cur = await db.execute("SELECT user_id FROM lobby_players WHERE lobby_id=?", (lobby_id,))
-        players = [row[0] for row in await cur.fetchall()]
-        try:
-            img = await generate_lobby_image({"number":lobby_id,"format":fmt,"map":map_name,"host_id":host_id,"registered_players":players}, bot)
-            if not img: return
-            path = save_image_temp(img)
-            markup = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✊ Присоединиться", callback_data=f"join_{lobby_id}")],
-                [InlineKeyboardButton(text="🔙 Выйти", callback_data=f"leave_{lobby_id}")]
-            ])
-            if msg_id:
-                try: await bot.delete_message(chat_id=CHANNEL_USERNAME, message_id=msg_id)
-                except: pass
-            msg = await bot.send_photo(chat_id=CHANNEL_USERNAME, photo=FSInputFile(path), caption=f"Лобби #{lobby_id} | {fmt} | {map_name}", reply_markup=markup)
-            await db.execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lobby_id))
-            await db.commit()
-            os.unlink(path)
-        except Exception as e:
-            logging.error(f"Ошибка публикации: {e}")
+    lobby = await db_fetchone("SELECT message_id, format, map, host_id FROM lobbies WHERE id=?", (lobby_id,))
+    if not lobby: return
+    msg_id, fmt, map_name, host_id = lobby['message_id'], lobby['format'], lobby['map'], lobby['host_id']
+    players = [r['user_id'] for r in await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?", (lobby_id,))]
+    try:
+        img = await generate_lobby_image({"number":lobby_id,"format":fmt,"map":map_name,"host_id":host_id,"registered_players":players}, bot)
+        if not img: return
+        path = save_image_temp(img)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✊ Присоединиться", callback_data=f"join_{lobby_id}")],
+            [InlineKeyboardButton(text="🔙 Выйти", callback_data=f"leave_{lobby_id}")]
+        ])
+        if msg_id:
+            try: await bot.delete_message(chat_id=CHANNEL_USERNAME, message_id=msg_id)
+            except: pass
+        msg = await bot.send_photo(chat_id=CHANNEL_USERNAME, photo=FSInputFile(path), caption=f"Лобби #{lobby_id} | {fmt} | {map_name}", reply_markup=markup)
+        await db_execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lobby_id))
+        os.unlink(path)
+    except Exception as e:
+        logging.error(f"Ошибка публикации: {e}")
 
 @dp.callback_query(F.data.startswith("join_"))
 async def join_lobby(callback: CallbackQuery, bot: Bot):
     lid = int(callback.data.split("_")[1])
     uid = callback.from_user.id
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT format, status FROM lobbies WHERE id=?", (lid,))
-        lobby = await cur.fetchone()
-        if not lobby or lobby[1]!='open': await callback.answer("Лобби закрыто.", show_alert=True); return
-        needed = {"5x5":10,"2x2":4,"1x1":2}[lobby[0]]
-        if await db.execute("SELECT * FROM lobby_players WHERE lobby_id=? AND user_id=?",(lid,uid)).fetchone():
-            await callback.answer("Уже в лобби.", show_alert=True); return
-        count = (await db.execute("SELECT COUNT(*) FROM lobby_players WHERE lobby_id=?",(lid,)).fetchone())[0]
-        if count >= needed: await callback.answer("Заполнено.", show_alert=True); return
-        await db.execute("INSERT INTO lobby_players VALUES (?,?,0)",(lid,uid)); await db.commit()
+    lobby = await db_fetchone("SELECT format, status FROM lobbies WHERE id=?", (lid,))
+    if not lobby or lobby['status']!='open': await callback.answer("Лобби закрыто.", show_alert=True); return
+    needed = {"5x5":10,"2x2":4,"1x1":2}[lobby['format']]
+    if await db_fetchone("SELECT * FROM lobby_players WHERE lobby_id=? AND user_id=?",(lid,uid)):
+        await callback.answer("Уже в лобби.", show_alert=True); return
+    count = (await db_fetchone("SELECT COUNT(*) as cnt FROM lobby_players WHERE lobby_id=?",(lid,)))['cnt']
+    if count >= needed: await callback.answer("Заполнено.", show_alert=True); return
+    await db_execute("INSERT INTO lobby_players VALUES (?,?,0)",(lid,uid))
     await update_lobby_image(bot, lid)
     if count+1 == needed:
-        host = (await db.execute("SELECT host_id FROM lobbies WHERE id=?",(lid,)).fetchone())[0]
+        host = (await db_fetchone("SELECT host_id FROM lobbies WHERE id=?",(lid,)))['host_id']
         try: await bot.send_message(host, f"Лобби #{lid} заполнено! Жеребьёвка.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Жеребьёвка", callback_data=f"shuffle_{lid}")]]))
         except: pass
     await callback.answer("Присоединился!")
@@ -684,30 +686,27 @@ async def join_lobby(callback: CallbackQuery, bot: Bot):
 @dp.callback_query(F.data.startswith("leave_"))
 async def leave_lobby(callback: CallbackQuery, bot: Bot):
     lid = int(callback.data.split("_")[1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM lobby_players WHERE lobby_id=? AND user_id=?",(lid,callback.from_user.id)); await db.commit()
+    await db_execute("DELETE FROM lobby_players WHERE lobby_id=? AND user_id=?",(lid,callback.from_user.id))
     await update_lobby_image(bot, lid)
     await callback.answer("Вышел.")
 
 @dp.callback_query(F.data.startswith("shuffle_"))
 async def shuffle_lobby(callback: CallbackQuery, bot: Bot):
     lid = int(callback.data.split("_")[1])
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT host_id, format, map, message_id FROM lobbies WHERE id=?",(lid,))
-        lobby = await cur.fetchone()
-        if not lobby or lobby[0]!=callback.from_user.id: await callback.answer("Только хост.", show_alert=True); return
-        players = [r[0] for r in await db.execute("SELECT user_id FROM lobby_players WHERE lobby_id=?",(lid,)).fetchall()]
-        random.shuffle(players); half = len(players)//2
-        for u in players[:half]: await db.execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?",(lid,u))
-        for u in players[half:]: await db.execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?",(lid,u))
-        await db.execute("UPDATE lobbies SET status='in_progress' WHERE id=?",(lid,)); await db.commit()
+    lobby = await db_fetchone("SELECT host_id, format, map, message_id FROM lobbies WHERE id=?",(lid,))
+    if not lobby or lobby['host_id']!=callback.from_user.id: await callback.answer("Только хост.", show_alert=True); return
+    players = [r['user_id'] for r in await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?",(lid,))]
+    random.shuffle(players); half = len(players)//2
+    for u in players[:half]: await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?",(lid,u))
+    for u in players[half:]: await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?",(lid,u))
+    await db_execute("UPDATE lobbies SET status='in_progress' WHERE id=?",(lid,))
     teams = {u: "CT" for u in players[:half]}; teams.update({u: "T" for u in players[half:]})
     try:
         img = await generate_draft_image({"teams":teams}, bot)
         if img:
             path = save_image_temp(img)
-            if lobby[3]:
-                try: await bot.delete_message(chat_id=CHANNEL_USERNAME, message_id=lobby[3])
+            if lobby['message_id']:
+                try: await bot.delete_message(chat_id=CHANNEL_USERNAME, message_id=lobby['message_id'])
                 except: pass
             await bot.send_photo(chat_id=CHANNEL_USERNAME, photo=FSInputFile(path), caption=f"⚔️ Жеребьёвка лобби #{lid}")
             os.unlink(path)
@@ -719,51 +718,138 @@ async def shuffle_lobby(callback: CallbackQuery, bot: Bot):
 
 @dp.message(F.text == "🔍 Найти матч")
 async def find_match(message: Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        lobbies = await db.execute("SELECT id, format, map FROM lobbies WHERE status='open' ORDER BY created_at DESC LIMIT 10").fetchall()
+    lobbies = await db_fetchall("SELECT id, format, map FROM lobbies WHERE status='open' ORDER BY created_at DESC LIMIT 10")
     if not lobbies: await message.answer("Нет открытых лобби."); return
-    for lid, fmt, mn in lobbies:
-        async with aiosqlite.connect(DB_NAME) as db:
-            count = (await db.execute("SELECT COUNT(*) FROM lobby_players WHERE lobby_id=?",(lid,)).fetchone())[0]
+    for lobby in lobbies:
+        lid, fmt, mn = lobby['id'], lobby['format'], lobby['map']
+        count = (await db_fetchone("SELECT COUNT(*) as cnt FROM lobby_players WHERE lobby_id=?",(lid,)))['cnt']
         needed = {"5x5":10,"2x2":4,"1x1":2}.get(fmt,10)
         await message.answer(f"Лобби #{lid} ({fmt}) {mn}\n{count}/{needed}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✊ Присоединиться", callback_data=f"join_{lid}")],
             [InlineKeyboardButton(text="🔙 Выйти", callback_data=f"leave_{lid}")]
         ]))
 
-# --- РЕЗУЛЬТАТЫ ---
-@dp.message(Command("result"))
-async def result_command(message: Message, state: FSMContext):
-    await message.answer("Пришли скриншот результатов.")
+# --- РЕЗУЛЬТАТЫ (НОВЫЙ ФОРМАТ) ---
+@dp.message(Command("results"))
+async def results_start(message: Message, state: FSMContext):
+    await message.answer("Введите номер лобби:")
+    await state.set_state(ResultStates.waiting_lobby_id)
+
+@dp.message(ResultStates.waiting_lobby_id)
+async def results_lobby_id(message: Message, state: FSMContext):
+    if not message.text.isdigit():
+        await message.answer("Номер лобби должен быть числом."); return
+    lid = int(message.text)
+    lobby = await db_fetchone("SELECT * FROM lobbies WHERE id=?", (lid,))
+    if not lobby:
+        await message.answer("Лобби не найдено."); return
+    if lobby['status'] != 'in_progress':
+        await message.answer("Матч ещё не начался или уже завершён."); return
+    await state.update_data(lobby_id=lid, host_id=lobby['host_id'], map_name=lobby['map'])
+    await message.answer("Пришлите скриншот результатов:")
     await state.set_state(ResultStates.waiting_screenshot)
 
 @dp.message(ResultStates.waiting_screenshot, F.photo)
-async def got_screenshot(message: Message, state: FSMContext):
+async def results_screenshot(message: Message, state: FSMContext):
     await state.update_data(screenshot=message.photo[-1].file_id)
-    await message.answer("Введи результаты: ID киллы смерти (каждая строка)")
-    await state.set_state(ResultStates.entering_results)
+    await message.answer("📊 Введите счёт матча в формате:\nCT T номер_лобби\nПример: 16 14 5")
+    await state.set_state(ResultStates.waiting_score)
 
-@dp.message(ResultStates.entering_results)
-async def process_results(message: Message, state: FSMContext, bot: Bot):
+@dp.message(ResultStates.waiting_score)
+async def results_score(message: Message, state: FSMContext, bot: Bot):
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        await message.answer("Неверный формат. Введите: CT T\nПример: 16 14"); return
+    try:
+        ct_score = int(parts[0])
+        t_score = int(parts[1])
+    except:
+        await message.answer("Счёт должен быть числом."); return
+
+    await state.update_data(ct_score=ct_score, t_score=t_score)
+    await message.answer("🔄 Команды поменялись сторонами?",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [InlineKeyboardButton(text="✅ Да, поменялись", callback_data="swap_yes")],
+                             [InlineKeyboardButton(text="❌ Нет", callback_data="swap_no")]
+                         ]))
+    await state.set_state(ResultStates.confirm_swap)
+
+@dp.callback_query(ResultStates.confirm_swap, F.data.in_(["swap_yes", "swap_no"]))
+async def results_swap(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    swapped = callback.data == "swap_yes"
     data = await state.get_data()
+    lid = data['lobby_id']
+    ct_score = data['ct_score']
+    t_score = data['t_score']
     screenshot = data['screenshot']
-    lines = message.text.strip().split('\n')
-    result_text = "🏁 Результаты:\n"
-    for line in lines:
-        parts = line.split()
-        if len(parts) >= 3:
-            uid, k, d = parts[0], int(parts[1]), int(parts[2])
-            change = k*10 - d*5
-            async with aiosqlite.connect(DB_NAME) as db:
-                await db.execute("UPDATE users SET elo=elo+?, kills=kills+?, deaths=deaths+?, matches_played=matches_played+1 WHERE user_id=?",
-                                 (change, k, d, uid))
-                await db.commit()
-            result_text += f"ID {uid}: {k}/{d} (ELO {change:+d})\n"
+    host_id = data['host_id']
+    map_name = data['map_name']
+
+    # Определяем победителя
+    if ct_score > t_score:
+        winner = "CT"
+        winner_team = 1
+    else:
+        winner = "T"
+        winner_team = 2
+
+    # Начисляем ELO победителям (+25 каждому)
+    players = await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?", (lid,))
+    for p in players:
+        uid = p['user_id']
+        player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
+        # Если команды поменялись — инвертируем
+        actual_team = player_team
+        if swapped:
+            actual_team = 2 if player_team == 1 else 1
+        if actual_team == winner_team:
+            await db_execute("UPDATE users SET elo=elo+25, matches_played=matches_played+1 WHERE user_id=?", (uid,))
+        else:
+            await db_execute("UPDATE users SET matches_played=matches_played+1 WHERE user_id=?", (uid,))
+
+    # Получаем списки игроков
+    ct_players = []
+    t_players = []
+    for p in players:
+        uid = p['user_id']
+        acc = await db_get_account(uid)
+        player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
+        actual_team = 2 if (player_team == 1 and swapped) or (player_team == 2 and not swapped) else player_team
+        elo = (await db_get_player(uid)).get('elo', 0) if await db_get_player(uid) else 0
+        if actual_team == 1:
+            ct_players.append(f"{len(ct_players)+1}. {acc['nickname']} (ELO: {elo})")
+        else:
+            t_players.append(f"{len(t_players)+1}. {acc['nickname']} (ELO: {elo})")
+
+    # Сохраняем матч
+    await db_execute(
+        "INSERT INTO matches (lobby_id, host_id, map, ct_score, t_score, teams_swapped, screenshot_id) VALUES (?,?,?,?,?,?,?)",
+        (lid, host_id, map_name, ct_score, t_score, int(swapped), screenshot)
+    )
+    await db_execute("UPDATE lobbies SET status='finished', teams_swapped=? WHERE id=?", (int(swapped), lid))
+
+    # Пост в канал
+    host_acc = await db_get_account(host_id)
+    host_name = host_acc['nickname'] if host_acc else str(host_id)
+    result_text = (
+        f"📊 РЕЗУЛЬТАТ МАТЧА\n"
+        f"Лобби #{lid} | host: {host_name}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🗺 🌴 {map_name}\n\n"
+        f"{'🔄 Команды поменялись сторонами' if swapped else ''}\n\n"
+        f"🔵 CT: {ct_score}\n{chr(10).join(ct_players)}\n\n"
+        f"🔴 T: {t_score}\n{chr(10).join(t_players)}\n\n"
+        f"🏆 Победитель: {winner}\n"
+        f"📸 Скриншот прилагается"
+    )
+
     try:
         await bot.send_photo(chat_id=CHANNEL_USERNAME, photo=screenshot, caption=result_text)
     except:
         await bot.send_message(chat_id=CHANNEL_USERNAME, text=result_text)
-    await message.answer("Сохранено.", reply_markup=main_keyboard())
+
+    await callback.message.delete()
+    await callback.message.answer("✅ Результаты сохранены и опубликованы!", reply_markup=main_keyboard())
     await state.clear()
 
 # --- ТИКЕТЫ ---
@@ -808,9 +894,7 @@ async def player_photo(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     photo_id = message.photo[-1].file_id if message.photo else "нет"
     content = f"👤 Жалоба на игрока\nНик цели: {data['target_nick']}\nОписание: {data['description']}\nОт: {data['from_nick']}"
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO tickets (user_id, type, content) VALUES (?, 'player', ?)", (message.from_user.id, content))
-        await db.commit()
+    await db_execute("INSERT INTO tickets (user_id, type, content) VALUES (?, 'player', ?)", (message.from_user.id, content))
     for admin_id in await get_admin_ids():
         try:
             if photo_id != "нет": await bot.send_photo(admin_id, photo_id, caption=content)
@@ -850,9 +934,7 @@ async def host_photo(message: Message, state: FSMContext):
 async def host_from(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     content = f"🎮 Жалоба на хоста\nНик: {data['host_nick']}\nЛобби: {data['lobby_number']}\nОписание: {data['description']}\nОт: {message.text}"
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO tickets (user_id, type, content) VALUES (?, 'host', ?)", (message.from_user.id, content))
-        await db.commit()
+    await db_execute("INSERT INTO tickets (user_id, type, content) VALUES (?, 'host', ?)", (message.from_user.id, content))
     for admin_id in await get_admin_ids():
         try:
             if data['photo'] != "нет": await bot.send_photo(admin_id, data['photo'], caption=content)
@@ -886,9 +968,7 @@ async def admin_photo(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     photo_id = message.photo[-1].file_id if message.photo else "нет"
     content = f"👮 Жалоба на админа\nНик: {data['admin_nick']}\nОписание: {data['description']}\nОт: {data['from_nick']}"
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT INTO tickets (user_id, type, content) VALUES (?, 'admin', ?)", (message.from_user.id, content))
-        await db.commit()
+    await db_execute("INSERT INTO tickets (user_id, type, content) VALUES (?, 'admin', ?)", (message.from_user.id, content))
     for admin_id in await get_admin_ids():
         if await is_leader(admin_id):
             try:
@@ -947,20 +1027,16 @@ async def shop_other(callback: CallbackQuery):
 # --- ТОП ---
 @dp.message(F.text == "🏆 Топ игроков FACEIT")
 async def top_players(message: Message):
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT user_id, nickname, elo FROM users ORDER BY elo DESC LIMIT 5")
-        top5 = await cursor.fetchall()
+    top5 = await db_fetchall("SELECT user_id, nickname, elo FROM users ORDER BY elo DESC LIMIT 5")
     medals = ["🥇","🥈","🥉","🏆","🏆"]
     text = "🏆 Топ FACEIT:\n"
     for i, row in enumerate(top5):
-        text += f"{medals[i]} {row[1]} : {row[2]} ELO | TOP {i+1}\n"
+        text += f"{medals[i]} {row['nickname']} : {row['elo']} ELO | TOP {i+1}\n"
     text += "————————————————\n"
     elo, rank = await get_elo_rank(message.from_user.id)
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT nickname FROM users WHERE user_id=?", (message.from_user.id,))
-        user = await cursor.fetchone()
+    user = await db_fetchone("SELECT nickname FROM users WHERE user_id=?", (message.from_user.id,))
     if user:
-        text += f"🔎 Твоё место: #{rank}\n🪪 {user[0]}\n🔫 ELO: {elo}"
+        text += f"🔎 Твоё место: #{rank}\n🪪 {user['nickname']}\n🔫 ELO: {elo}"
     else:
         text += "Ты не зарегистрирован."
     await message.answer(text)
@@ -1029,52 +1105,44 @@ async def _process_nickname(message: Message, state: FSMContext, bot: Bot):
         await _add_admin(message, state, bot, user_id)
     elif action == "remove_admin":
         await _remove_admin(message, state, bot, user_id)
+    elif action == "lobby_ban":
+        await _lobby_ban(message, state, bot, user_id)
+    elif action == "lobby_unban":
+        await _lobby_unban(message, state, bot, user_id)
     await state.clear()
 
 async def _give_premium(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET premium=1 WHERE user_id=?", (user_id,))
-        await db.commit()
+    await db_execute("UPDATE users SET premium=1 WHERE user_id=?", (user_id,))
     await message.answer(f"✅ Премиум выдан пользователю {user_id}.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, "🎉 Вам выдан премиум статус!")
     except: pass
 
 async def _remove_premium(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET premium=0 WHERE user_id=?", (user_id,))
-        await db.commit()
+    await db_execute("UPDATE users SET premium=0 WHERE user_id=?", (user_id,))
     await message.answer(f"✅ Премиум снят с пользователя {user_id}.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, "💔 Ваш премиум статус был снят.")
     except: pass
 
 async def _give_verify(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET verified=1 WHERE user_id=?", (user_id,))
-        await db.commit()
+    await db_execute("UPDATE users SET verified=1 WHERE user_id=?", (user_id,))
     await message.answer(f"✅ Верификация выдана пользователю {user_id}.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, "✅ Вы получили верификацию! Теперь у вас галочка рядом с ником.")
     except: pass
 
 async def _remove_verify(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE users SET verified=0 WHERE user_id=?", (user_id,))
-        await db.commit()
+    await db_execute("UPDATE users SET verified=0 WHERE user_id=?", (user_id,))
     await message.answer(f"✅ Верификация снята с пользователя {user_id}.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, "❌ Ваша верификация была снята.")
     except: pass
 
 async def _unban(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("DELETE FROM bans WHERE user_id=?", (user_id,))
-        await db.commit()
+    await db_execute("DELETE FROM bans WHERE user_id=?", (user_id,))
     await message.answer(f"✅ Пользователь {user_id} разбанен.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, "🔓 Вы были разбанены и снова можете пользоваться ботом.")
     except: pass
 
 async def _add_admin(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO admins VALUES (?, 'admin')", (user_id,))
-        await db.commit()
+    await db_execute("INSERT OR REPLACE INTO admins VALUES (?, 'admin')", (user_id,))
     await message.answer(f"✅ Пользователь {user_id} назначен администратором.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, "🛡️ Вы были назначены администратором проекта 404hp FACEIT.")
     except: pass
@@ -1083,16 +1151,25 @@ async def _remove_admin(message: Message, state: FSMContext, bot: Bot, user_id: 
     if user_id == message.from_user.id:
         await message.answer("Нельзя удалить самого себя.")
         return
-    async with aiosqlite.connect(DB_NAME) as db:
-        cursor = await db.execute("SELECT role FROM admins WHERE user_id=?", (user_id,))
-        row = await cursor.fetchone()
-        if row and row[0] == 'leader':
-            await message.answer("Нельзя удалить руководителя.")
-            return
-        await db.execute("DELETE FROM admins WHERE user_id=?", (user_id,))
-        await db.commit()
+    row = await db_fetchone("SELECT role FROM admins WHERE user_id=?", (user_id,))
+    if row and row['role'] == 'leader':
+        await message.answer("Нельзя удалить руководителя.")
+        return
+    await db_execute("DELETE FROM admins WHERE user_id=?", (user_id,))
     await message.answer(f"✅ Пользователь {user_id} снят с должности администратора.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, "⚠️ Вы были сняты с должности администратора.")
+    except: pass
+
+async def _lobby_ban(message: Message, state: FSMContext, bot: Bot, user_id: int):
+    await db_execute("UPDATE users SET can_create_lobby=0 WHERE user_id=?", (user_id,))
+    await message.answer(f"⛔ Пользователю {user_id} запрещено создавать лобби.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "⛔ Вам запретили создавать лобби.")
+    except: pass
+
+async def _lobby_unban(message: Message, state: FSMContext, bot: Bot, user_id: int):
+    await db_execute("UPDATE users SET can_create_lobby=1 WHERE user_id=?", (user_id,))
+    await message.answer(f"✅ Пользователю {user_id} снова разрешено создавать лобби.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "✅ Вам снова разрешено создавать лобби.")
     except: pass
 
 @dp.callback_query(F.data == "admin_give_premium")
@@ -1147,6 +1224,18 @@ async def remove_admin_cb(callback: CallbackQuery, state: FSMContext):
     await callback.message.delete()
     await _ask_nickname_for(callback.message, state, "remove_admin")
 
+@dp.callback_query(F.data == "admin_lobby_ban")
+async def lobby_ban_cb(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id): return
+    await callback.message.delete()
+    await _ask_nickname_for(callback.message, state, "lobby_ban")
+
+@dp.callback_query(F.data == "admin_lobby_unban")
+async def lobby_unban_cb(callback: CallbackQuery, state: FSMContext):
+    if not await is_admin(callback.from_user.id): return
+    await callback.message.delete()
+    await _ask_nickname_for(callback.message, state, "lobby_unban")
+
 @dp.message(AdminNickInput.waiting_nickname)
 async def admin_nickname_handler(message: Message, state: FSMContext, bot: Bot):
     await _process_nickname(message, state, bot)
@@ -1172,9 +1261,7 @@ async def admin_duration_handler(message: Message, state: FSMContext, bot: Bot):
         except:
             await message.answer("Неверный формат. Введите число часов или 'permanent'.")
             return
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR REPLACE INTO bans VALUES (?,?,?)", (user_id, reason, until))
-        await db.commit()
+    await db_execute("INSERT OR REPLACE INTO bans VALUES (?,?,?)", (user_id, reason, until))
     await message.answer(f"✅ Пользователь {user_id} забанен до {until}.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, f"🚫 Вы были забанены. Причина: {reason}. Срок: {until}")
     except: pass
@@ -1190,18 +1277,16 @@ async def test_shuffle_cb(callback: CallbackQuery, state: FSMContext):
 @dp.message(AdminTestShuffle.waiting_lobby_id)
 async def test_shuffle_process(message: Message, state: FSMContext, bot: Bot):
     lid = int(message.text)
-    async with aiosqlite.connect(DB_NAME) as db:
-        cur = await db.execute("SELECT host_id, format, map FROM lobbies WHERE id=?", (lid,))
-        lobby = await cur.fetchone()
-        if not lobby:
-            await message.answer("Лобби не найдено."); await state.clear(); return
-        players = [r[0] for r in await db.execute("SELECT user_id FROM lobby_players WHERE lobby_id=?",(lid,)).fetchall()]
-        if len(players) < 2:
-            await message.answer("⚠️ Мало игроков."); await state.clear(); return
-        random.shuffle(players); half = len(players)//2
-        for u in players[:half]: await db.execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?",(lid,u))
-        for u in players[half:]: await db.execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?",(lid,u))
-        await db.execute("UPDATE lobbies SET status='in_progress' WHERE id=?",(lid,)); await db.commit()
+    lobby = await db_fetchone("SELECT host_id, format, map FROM lobbies WHERE id=?", (lid,))
+    if not lobby:
+        await message.answer("Лобби не найдено."); await state.clear(); return
+    players = [r['user_id'] for r in await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?",(lid,))]
+    if len(players) < 2:
+        await message.answer("⚠️ Мало игроков."); await state.clear(); return
+    random.shuffle(players); half = len(players)//2
+    for u in players[:half]: await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?",(lid,u))
+    for u in players[half:]: await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?",(lid,u))
+    await db_execute("UPDATE lobbies SET status='in_progress' WHERE id=?",(lid,))
     teams = {u: "CT" for u in players[:half]}; teams.update({u: "T" for u in players[half:]})
     try:
         img = await generate_draft_image({"teams":teams}, bot)
@@ -1216,14 +1301,13 @@ async def test_shuffle_process(message: Message, state: FSMContext, bot: Bot):
 @dp.callback_query(F.data == "admin_review_ticket")
 async def review_tickets_cb(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id): return
-    async with aiosqlite.connect(DB_NAME) as db:
-        tickets = await db.execute("SELECT id, user_id, type, content FROM tickets WHERE status='open' LIMIT 10").fetchall()
+    tickets = await db_fetchall("SELECT id, user_id, type, content FROM tickets WHERE status='open' LIMIT 10")
     if not tickets:
         await callback.message.edit_text("Нет открытых тикетов.", reply_markup=back_to_menu())
         return
     text = "📋 Открытые тикеты:\n"
     for t in tickets:
-        text += f"#{t[0]} от {t[1]} ({t[2]}): {t[3][:100]}...\n\n"
+        text += f"#{t['id']} от {t['user_id']} ({t['type']}): {t['content'][:100]}...\n\n"
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Закрыть тикет", callback_data="admin_close_ticket")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel_back")]
@@ -1239,9 +1323,7 @@ async def close_ticket_cb(callback: CallbackQuery, state: FSMContext):
 async def close_ticket_process(message: Message, state: FSMContext):
     if not message.text.isdigit(): await message.answer("Число."); return
     tid = int(message.text)
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("UPDATE tickets SET status='closed' WHERE id=?", (tid,))
-        await db.commit()
+    await db_execute("UPDATE tickets SET status='closed' WHERE id=?", (tid,))
     await message.answer(f"Тикет #{tid} закрыт.", reply_markup=main_keyboard())
     await state.clear()
 
@@ -1256,7 +1338,7 @@ async def go_main_menu_cb(callback: CallbackQuery):
 
 # ==================== ЗАПУСК ====================
 async def main():
-    await init_db()
+    init_db()
     bot = Bot(token=BOT_TOKEN)
     await dp.start_polling(bot)
 
