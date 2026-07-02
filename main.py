@@ -51,7 +51,7 @@ MAP_IMAGES = {
     "Arena": "https://i.ibb.co/7J66n9dN/breeze.png"
 }
 
-# ==================== БАЗА ДАННЫХ (sqlite3) ====================
+# ==================== БАЗА ДАННЫХ ====================
 def _get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -66,7 +66,8 @@ def init_db():
             nickname TEXT,
             game_id TEXT,
             elo INTEGER DEFAULT 1000,
-            can_create_lobby INTEGER DEFAULT 1
+            can_create_lobby INTEGER DEFAULT 1,
+            premium_until TEXT
         );
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY,
@@ -123,12 +124,16 @@ def init_db():
         ("kills", "INTEGER DEFAULT 0"),
         ("deaths", "INTEGER DEFAULT 0"),
         ("avatar_path", "TEXT DEFAULT ''"),
-        ("avatar_file_id", "TEXT DEFAULT '')
+        ("avatar_file_id", "TEXT DEFAULT ''")
     ]:
         try:
             conn.execute(f"ALTER TABLE users ADD COLUMN {col} {col_def}")
         except sqlite3.OperationalError:
             pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -208,11 +213,21 @@ async def db_get_account(user_id: int) -> dict | None:
     return await db_fetchone("SELECT nickname, game_id FROM users WHERE user_id=?", (user_id,))
 
 async def db_get_player(user_id: int) -> dict | None:
-    return await db_fetchone("SELECT elo, kills, deaths, matches_played, premium, verified FROM users WHERE user_id=?", (user_id,))
+    return await db_fetchone("SELECT elo, kills, deaths, matches_played, premium, verified, premium_until FROM users WHERE user_id=?", (user_id,))
 
 async def is_premium(user_id: int) -> bool:
-    row = await db_fetchone("SELECT premium FROM users WHERE user_id=?", (user_id,))
-    return row and row['premium'] == 1
+    row = await db_fetchone("SELECT premium, premium_until FROM users WHERE user_id=?", (user_id,))
+    if not row or row['premium'] != 1:
+        return False
+    if row['premium_until']:
+        try:
+            until = datetime.fromisoformat(row['premium_until'])
+            if datetime.now() > until:
+                await db_execute("UPDATE users SET premium=0, premium_until=NULL WHERE user_id=?", (user_id,))
+                return False
+        except:
+            pass
+    return True
 
 async def is_verified(user_id: int) -> bool:
     row = await db_fetchone("SELECT verified FROM users WHERE user_id=?", (user_id,))
@@ -458,19 +473,21 @@ class ResultStates(StatesGroup):
 
 class AdminNickInput(StatesGroup): waiting_nickname = State()
 class AdminReasonInput(StatesGroup): waiting_reason = State()
-class AdminDurationInput(StatesGroup): waiting_duration = State()
+class AdminSelectBanDuration(StatesGroup): waiting_selection = State()
+class AdminSelectPremiumDuration(StatesGroup): waiting_selection = State()
 class AdminTicketReview(StatesGroup): waiting_ticket_id = State()
 class AdminTestShuffle(StatesGroup): waiting_lobby_id = State()
-class AdminLobbyBan(StatesGroup): waiting_nickname = State()
 class AvatarUpload(StatesGroup): waiting_photo = State()
 
 # ==================== КЛАВИАТУРЫ ====================
 def main_keyboard():
     builder = ReplyKeyboardBuilder()
-    for b in ["👤 Профиль","🔍 Найти матч","➕ Создать матч","🎟 Тикет поддержки","🛒 Магазин",
-              "🏆 Топ игроков FACEIT","📰 Новости","💬 Чат проекта","📜 Регламент проекта",
-              "🛠 Админ-панель","🖼 Установить аватар"]:
+    for b in ["👤 Профиль","🔍 Найти матч","➕ Создать матч","🎮 Мои лобби",
+              "🎟 Тикет поддержки","🛒 Магазин",
+              "🏆 Топ игроков FACEIT","📰 Новости","💬 Чат проекта",
+              "📜 Регламент проекта","🛠 Админ-панель","🖼 Установить аватар"]:
         builder.button(text=b)
+    builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
 
 def back_to_menu():
@@ -491,6 +508,26 @@ def admin_panel_keyboard():
         [InlineKeyboardButton(text="11. Выдать админку", callback_data="admin_add_admin")],
         [InlineKeyboardButton(text="12. Забрать админку", callback_data="admin_remove_admin")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+    ])
+
+def ban_duration_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="10 минут", callback_data="ban_10m")],
+        [InlineKeyboardButton(text="30 минут", callback_data="ban_30m")],
+        [InlineKeyboardButton(text="1 час", callback_data="ban_1h")],
+        [InlineKeyboardButton(text="1 день", callback_data="ban_1d")],
+        [InlineKeyboardButton(text="1 неделя", callback_data="ban_1w")],
+        [InlineKeyboardButton(text="1 месяц", callback_data="ban_1mo")],
+        [InlineKeyboardButton(text="1 год", callback_data="ban_1y")],
+        [InlineKeyboardButton(text="Навсегда", callback_data="ban_forever")],
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="main_menu")]
+    ])
+
+def premium_duration_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="1 месяц", callback_data="prem_1mo")],
+        [InlineKeyboardButton(text="1 год", callback_data="prem_1y")],
+        [InlineKeyboardButton(text="🔙 Отмена", callback_data="main_menu")]
     ])
 
 # ==================== ОБРАБОТЧИКИ ====================
@@ -562,7 +599,9 @@ async def profile(message: Message, bot: Bot):
         path = save_image_temp(img)
         elo, rank = await get_elo_rank(user_id)
         kd = player.get('kills',0)/max(1,player.get('deaths',1))
-        await message.answer_photo(FSInputFile(path), caption=f"🪪 {acc['nickname']}\n🔗 ID: {acc['game_id']}\n🔫 K/D: {kd:.2f}\n🏆 Место: #{rank}\n⭐ Premium: {'✅' if await is_premium(user_id) else '❌'}\n✊ ELO: {elo}\n✅ Верификация: {'✅' if await is_verified(user_id) else '❌'}")
+        premium = await is_premium(user_id)
+        verified = await is_verified(user_id)
+        await message.answer_photo(FSInputFile(path), caption=f"🪪 {acc['nickname']}\n🔗 ID: {acc['game_id']}\n🔫 K/D: {kd:.2f}\n🏆 Место: #{rank}\n⭐ Premium: {'✅' if premium else '❌'}\n✊ ELO: {elo}\n✅ Верификация: {'✅' if verified else '❌'}")
         os.unlink(path)
     except Exception as e:
         logging.error(f"Ошибка профиля: {e}"); await message.answer("Ошибка создания карточки.")
@@ -582,6 +621,61 @@ async def avatar_photo_handler(message: Message, state: FSMContext):
 @dp.message(AvatarUpload.waiting_photo, ~F.photo)
 async def avatar_not_photo(message: Message):
     await message.answer("Пожалуйста, отправьте изображение.")
+
+# --- МОИ ЛОББИ ---
+@dp.message(F.text == "🎮 Мои лобби")
+async def my_lobbies(message: Message):
+    user_id = message.from_user.id
+    lobbies = await db_fetchall("SELECT id, format, map, status FROM lobbies WHERE host_id=? ORDER BY created_at DESC", (user_id,))
+    if not lobbies:
+        await message.answer("У вас нет созданных лобби."); return
+    text = "🎮 Ваши лобби:\n"
+    builder = InlineKeyboardBuilder()
+    for lobby in lobbies:
+        text += f"Лобби #{lobby['id']} ({lobby['format']}) {lobby['map']} — {lobby['status']}\n"
+        builder.button(text=f"Лобби #{lobby['id']}", callback_data=f"mylobby_{lobby['id']}")
+    builder.button(text="🔙 Назад", callback_data="main_menu")
+    builder.adjust(1)
+    await message.answer(text, reply_markup=builder.as_markup())
+
+@dp.callback_query(F.data.startswith("mylobby_"))
+async def mylobby_action(callback: CallbackQuery):
+    lobby_id = int(callback.data.split("_")[1])
+    lobby = await db_fetchone("SELECT * FROM lobbies WHERE id=?", (lobby_id,))
+    if not lobby or lobby['host_id'] != callback.from_user.id:
+        await callback.answer("Это не ваше лобби.", show_alert=True); return
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Отменить лобби", callback_data=f"cancel_lobby_{lobby_id}")],
+        [InlineKeyboardButton(text="Зарегистрировать результат", callback_data=f"result_lobby_{lobby_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
+    ])
+    await callback.message.edit_text(f"Лобби #{lobby_id} ({lobby['format']}) {lobby['map']} — {lobby['status']}", reply_markup=markup)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cancel_lobby_"))
+async def cancel_my_lobby(callback: CallbackQuery, bot: Bot):
+    lobby_id = int(callback.data.split("_")[2])
+    lobby = await db_fetchone("SELECT * FROM lobbies WHERE id=?", (lobby_id,))
+    if not lobby or lobby['host_id'] != callback.from_user.id or lobby['status'] != 'open':
+        await callback.answer("Недоступно.", show_alert=True); return
+    if lobby['message_id']:
+        try: await bot.delete_message(chat_id=CHANNEL_USERNAME, message_id=lobby['message_id'])
+        except: pass
+    await db_execute("DELETE FROM lobby_players WHERE lobby_id=?", (lobby_id,))
+    await db_execute("DELETE FROM lobbies WHERE id=?", (lobby_id,))
+    await callback.message.edit_text("✅ Лобби отменено.")
+    await callback.answer("Лобби удалено.")
+
+@dp.callback_query(F.data.startswith("result_lobby_"))
+async def result_from_mylobby(callback: CallbackQuery, state: FSMContext):
+    lobby_id = int(callback.data.split("_")[2])
+    lobby = await db_fetchone("SELECT * FROM lobbies WHERE id=?", (lobby_id,))
+    if not lobby or lobby['host_id'] != callback.from_user.id or lobby['status'] != 'in_progress':
+        await callback.answer("Матч не начат или уже завершён.", show_alert=True); return
+    await state.update_data(lobby_id=lobby_id, host_id=lobby['host_id'], map_name=lobby['map'])
+    await callback.message.answer("Пришлите скриншот результатов:")
+    await state.set_state(ResultStates.waiting_screenshot)
+    await callback.answer()
 
 # --- ЛОББИ ---
 @dp.message(F.text == "➕ Создать матч")
@@ -729,7 +823,7 @@ async def find_match(message: Message):
             [InlineKeyboardButton(text="🔙 Выйти", callback_data=f"leave_{lid}")]
         ]))
 
-# --- РЕЗУЛЬТАТЫ (НОВЫЙ ФОРМАТ) ---
+# --- РЕЗУЛЬТАТЫ ---
 @dp.message(Command("results"))
 async def results_start(message: Message, state: FSMContext):
     await message.answer("Введите номер лобби:")
@@ -737,14 +831,11 @@ async def results_start(message: Message, state: FSMContext):
 
 @dp.message(ResultStates.waiting_lobby_id)
 async def results_lobby_id(message: Message, state: FSMContext):
-    if not message.text.isdigit():
-        await message.answer("Номер лобби должен быть числом."); return
+    if not message.text.isdigit(): await message.answer("Номер лобби должен быть числом."); return
     lid = int(message.text)
     lobby = await db_fetchone("SELECT * FROM lobbies WHERE id=?", (lid,))
-    if not lobby:
-        await message.answer("Лобби не найдено."); return
-    if lobby['status'] != 'in_progress':
-        await message.answer("Матч ещё не начался или уже завершён."); return
+    if not lobby: await message.answer("Лобби не найдено."); return
+    if lobby['status'] != 'in_progress': await message.answer("Матч не начат или завершён."); return
     await state.update_data(lobby_id=lid, host_id=lobby['host_id'], map_name=lobby['map'])
     await message.answer("Пришлите скриншот результатов:")
     await state.set_state(ResultStates.waiting_screenshot)
@@ -752,20 +843,16 @@ async def results_lobby_id(message: Message, state: FSMContext):
 @dp.message(ResultStates.waiting_screenshot, F.photo)
 async def results_screenshot(message: Message, state: FSMContext):
     await state.update_data(screenshot=message.photo[-1].file_id)
-    await message.answer("📊 Введите счёт матча в формате:\nCT T номер_лобби\nПример: 16 14 5")
+    await message.answer("📊 Введите счёт матча в формате:\nCT T\nПример: 16 14")
     await state.set_state(ResultStates.waiting_score)
 
 @dp.message(ResultStates.waiting_score)
 async def results_score(message: Message, state: FSMContext, bot: Bot):
     parts = message.text.strip().split()
-    if len(parts) < 2:
-        await message.answer("Неверный формат. Введите: CT T\nПример: 16 14"); return
+    if len(parts) < 2: await message.answer("Неверный формат. Введите: CT T"); return
     try:
-        ct_score = int(parts[0])
-        t_score = int(parts[1])
-    except:
-        await message.answer("Счёт должен быть числом."); return
-
+        ct_score = int(parts[0]); t_score = int(parts[1])
+    except: await message.answer("Счёт должен быть числом."); return
     await state.update_data(ct_score=ct_score, t_score=t_score)
     await message.answer("🔄 Команды поменялись сторонами?",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -778,76 +865,36 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
 async def results_swap(callback: CallbackQuery, state: FSMContext, bot: Bot):
     swapped = callback.data == "swap_yes"
     data = await state.get_data()
-    lid = data['lobby_id']
-    ct_score = data['ct_score']
-    t_score = data['t_score']
-    screenshot = data['screenshot']
-    host_id = data['host_id']
-    map_name = data['map_name']
-
-    # Определяем победителя
-    if ct_score > t_score:
-        winner = "CT"
-        winner_team = 1
-    else:
-        winner = "T"
-        winner_team = 2
-
-    # Начисляем ELO победителям (+25 каждому)
+    lid, ct_score, t_score, screenshot, host_id, map_name = data['lobby_id'], data['ct_score'], data['t_score'], data['screenshot'], data['host_id'], data['map_name']
+    winner = "CT" if ct_score > t_score else "T"
+    winner_team = 1 if winner == "CT" else 2
     players = await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?", (lid,))
     for p in players:
         uid = p['user_id']
         player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
-        # Если команды поменялись — инвертируем
-        actual_team = player_team
-        if swapped:
-            actual_team = 2 if player_team == 1 else 1
+        actual_team = 2 if (player_team == 1 and swapped) or (player_team == 2 and not swapped) else player_team
         if actual_team == winner_team:
             await db_execute("UPDATE users SET elo=elo+25, matches_played=matches_played+1 WHERE user_id=?", (uid,))
         else:
             await db_execute("UPDATE users SET matches_played=matches_played+1 WHERE user_id=?", (uid,))
-
-    # Получаем списки игроков
-    ct_players = []
-    t_players = []
+    ct_list, t_list = [], []
     for p in players:
-        uid = p['user_id']
-        acc = await db_get_account(uid)
+        uid = p['user_id']; acc = await db_get_account(uid)
         player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
         actual_team = 2 if (player_team == 1 and swapped) or (player_team == 2 and not swapped) else player_team
-        elo = (await db_get_player(uid)).get('elo', 0) if await db_get_player(uid) else 0
-        if actual_team == 1:
-            ct_players.append(f"{len(ct_players)+1}. {acc['nickname']} (ELO: {elo})")
-        else:
-            t_players.append(f"{len(t_players)+1}. {acc['nickname']} (ELO: {elo})")
-
-    # Сохраняем матч
-    await db_execute(
-        "INSERT INTO matches (lobby_id, host_id, map, ct_score, t_score, teams_swapped, screenshot_id) VALUES (?,?,?,?,?,?,?)",
-        (lid, host_id, map_name, ct_score, t_score, int(swapped), screenshot)
-    )
+        elo = (await db_get_player(uid))['elo'] if await db_get_player(uid) else 0
+        (ct_list if actual_team == 1 else t_list).append(f"{len(ct_list if actual_team==1 else t_list)+1}. {acc['nickname']} (ELO: {elo})")
+    await db_execute("INSERT INTO matches (lobby_id, host_id, map, ct_score, t_score, teams_swapped, screenshot_id) VALUES (?,?,?,?,?,?,?)",
+                     (lid, host_id, map_name, ct_score, t_score, int(swapped), screenshot))
     await db_execute("UPDATE lobbies SET status='finished', teams_swapped=? WHERE id=?", (int(swapped), lid))
-
-    # Пост в канал
     host_acc = await db_get_account(host_id)
     host_name = host_acc['nickname'] if host_acc else str(host_id)
-    result_text = (
-        f"📊 РЕЗУЛЬТАТ МАТЧА\n"
-        f"Лобби #{lid} | host: {host_name}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🗺 🌴 {map_name}\n\n"
-        f"{'🔄 Команды поменялись сторонами' if swapped else ''}\n\n"
-        f"🔵 CT: {ct_score}\n{chr(10).join(ct_players)}\n\n"
-        f"🔴 T: {t_score}\n{chr(10).join(t_players)}\n\n"
-        f"🏆 Победитель: {winner}\n"
-        f"📸 Скриншот прилагается"
-    )
-
-    try:
-        await bot.send_photo(chat_id=CHANNEL_USERNAME, photo=screenshot, caption=result_text)
-    except:
-        await bot.send_message(chat_id=CHANNEL_USERNAME, text=result_text)
-
+    result_text = (f"📊 РЕЗУЛЬТАТ МАТЧА\nЛобби #{lid} | host: {host_name}\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                   f"🗺 🌴 {map_name}\n\n{'🔄 Команды поменялись сторонами' if swapped else ''}\n\n"
+                   f"🔵 CT: {ct_score}\n{chr(10).join(ct_list)}\n\n🔴 T: {t_score}\n{chr(10).join(t_list)}\n\n"
+                   f"🏆 Победитель: {winner}\n📸 Скриншот прилагается")
+    try: await bot.send_photo(chat_id=CHANNEL_USERNAME, photo=screenshot, caption=result_text)
+    except: await bot.send_message(chat_id=CHANNEL_USERNAME, text=result_text)
     await callback.message.delete()
     await callback.message.answer("✅ Результаты сохранены и опубликованы!", reply_markup=main_keyboard())
     await state.clear()
@@ -855,39 +902,30 @@ async def results_swap(callback: CallbackQuery, state: FSMContext, bot: Bot):
 # --- ТИКЕТЫ ---
 @dp.message(F.text == "🎟 Тикет поддержки")
 async def ticket_menu(message: Message):
-    markup = InlineKeyboardMarkup(inline_keyboard=[
+    await message.answer("Тикет:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1. Жалоба на игрока", callback_data="ticket_player")],
         [InlineKeyboardButton(text="2. Жалоба на хоста", callback_data="ticket_host")],
         [InlineKeyboardButton(text="3. Жалоба на администрацию", callback_data="ticket_admin")],
         [InlineKeyboardButton(text="4. Вопросы по проекту", callback_data="ticket_faq")],
         [InlineKeyboardButton(text="5. Получить верификацию", callback_data="ticket_verify")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
-    ])
-    await message.answer("Тикет:", reply_markup=markup)
+    ]))
 
 @dp.callback_query(F.data == "ticket_player")
 async def ticket_player(callback: CallbackQuery, state: FSMContext):
-    await callback.message.delete()
-    await callback.message.answer("Введи ник игрока:")
-    await state.set_state(TicketPlayerStates.nick)
+    await callback.message.delete(); await callback.message.answer("Введи ник игрока:"); await state.set_state(TicketPlayerStates.nick)
 
 @dp.message(TicketPlayerStates.nick)
 async def player_nick(message: Message, state: FSMContext):
-    await state.update_data(target_nick=message.text)
-    await message.answer("Опиши жалобу:")
-    await state.set_state(TicketPlayerStates.description)
+    await state.update_data(target_nick=message.text); await message.answer("Опиши жалобу:"); await state.set_state(TicketPlayerStates.description)
 
 @dp.message(TicketPlayerStates.description)
 async def player_desc(message: Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await message.answer("От кого (твой ник):")
-    await state.set_state(TicketPlayerStates.from_nick)
+    await state.update_data(description=message.text); await message.answer("От кого (твой ник):"); await state.set_state(TicketPlayerStates.from_nick)
 
 @dp.message(TicketPlayerStates.from_nick)
 async def player_from(message: Message, state: FSMContext):
-    await state.update_data(from_nick=message.text)
-    await message.answer("Прикрепи скриншот (или '-')")
-    await state.set_state(TicketPlayerStates.photo)
+    await state.update_data(from_nick=message.text); await message.answer("Прикрепи скриншот (или '-')"); await state.set_state(TicketPlayerStates.photo)
 
 @dp.message(TicketPlayerStates.photo)
 async def player_photo(message: Message, state: FSMContext, bot: Bot):
@@ -900,36 +938,30 @@ async def player_photo(message: Message, state: FSMContext, bot: Bot):
             if photo_id != "нет": await bot.send_photo(admin_id, photo_id, caption=content)
             else: await bot.send_message(admin_id, content)
         except: pass
-    await message.answer("Отправлено.", reply_markup=main_keyboard())
-    await state.clear()
+    await message.answer("Отправлено.", reply_markup=main_keyboard()); await state.clear()
 
 @dp.callback_query(F.data == "ticket_host")
 async def ticket_host(callback: CallbackQuery, state: FSMContext):
-    await callback.message.delete()
-    await callback.message.answer("Введи ник хоста:")
-    await state.set_state(TicketHostStates.host_nick)
+    await callback.message.delete(); await callback.message.answer("Введи ник хоста:"); await state.set_state(TicketHostStates.host_nick)
+
 @dp.message(TicketHostStates.host_nick)
 async def host_nick(message: Message, state: FSMContext):
-    await state.update_data(host_nick=message.text)
-    await message.answer("Номер лобби:")
-    await state.set_state(TicketHostStates.lobby_number)
+    await state.update_data(host_nick=message.text); await message.answer("Номер лобби:"); await state.set_state(TicketHostStates.lobby_number)
+
 @dp.message(TicketHostStates.lobby_number)
 async def host_lobby(message: Message, state: FSMContext):
     if not message.text.isdigit(): await message.answer("Число."); return
-    await state.update_data(lobby_number=message.text)
-    await message.answer("Описание:")
-    await state.set_state(TicketHostStates.description)
+    await state.update_data(lobby_number=message.text); await message.answer("Описание:"); await state.set_state(TicketHostStates.description)
+
 @dp.message(TicketHostStates.description)
 async def host_desc(message: Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await message.answer("Скриншот (или '-'):")
-    await state.set_state(TicketHostStates.photo)
+    await state.update_data(description=message.text); await message.answer("Скриншот (или '-'):"); await state.set_state(TicketHostStates.photo)
+
 @dp.message(TicketHostStates.photo)
 async def host_photo(message: Message, state: FSMContext):
     photo_id = message.photo[-1].file_id if message.photo else "нет"
-    await state.update_data(photo=photo_id)
-    await message.answer("От кого:")
-    await state.set_state(TicketHostStates.from_nick)
+    await state.update_data(photo=photo_id); await message.answer("От кого:"); await state.set_state(TicketHostStates.from_nick)
+
 @dp.message(TicketHostStates.from_nick)
 async def host_from(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
@@ -940,29 +972,24 @@ async def host_from(message: Message, state: FSMContext, bot: Bot):
             if data['photo'] != "нет": await bot.send_photo(admin_id, data['photo'], caption=content)
             else: await bot.send_message(admin_id, content)
         except: pass
-    await message.answer("Отправлено.", reply_markup=main_keyboard())
-    await state.clear()
+    await message.answer("Отправлено.", reply_markup=main_keyboard()); await state.clear()
 
 @dp.callback_query(F.data == "ticket_admin")
 async def ticket_admin(callback: CallbackQuery, state: FSMContext):
-    await callback.message.delete()
-    await callback.message.answer("Ник админа:")
-    await state.set_state(TicketAdminStates.admin_nick)
+    await callback.message.delete(); await callback.message.answer("Ник админа:"); await state.set_state(TicketAdminStates.admin_nick)
+
 @dp.message(TicketAdminStates.admin_nick)
 async def admin_nick(message: Message, state: FSMContext):
-    await state.update_data(admin_nick=message.text)
-    await message.answer("Описание:")
-    await state.set_state(TicketAdminStates.description)
+    await state.update_data(admin_nick=message.text); await message.answer("Описание:"); await state.set_state(TicketAdminStates.description)
+
 @dp.message(TicketAdminStates.description)
 async def admin_desc(message: Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await message.answer("От кого:")
-    await state.set_state(TicketAdminStates.from_nick)
+    await state.update_data(description=message.text); await message.answer("От кого:"); await state.set_state(TicketAdminStates.from_nick)
+
 @dp.message(TicketAdminStates.from_nick)
 async def admin_from(message: Message, state: FSMContext):
-    await state.update_data(from_nick=message.text)
-    await message.answer("Скриншот:")
-    await state.set_state(TicketAdminStates.photo)
+    await state.update_data(from_nick=message.text); await message.answer("Скриншот:"); await state.set_state(TicketAdminStates.photo)
+
 @dp.message(TicketAdminStates.photo)
 async def admin_photo(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
@@ -975,8 +1002,7 @@ async def admin_photo(message: Message, state: FSMContext, bot: Bot):
                 if photo_id != "нет": await bot.send_photo(admin_id, photo_id, caption=content)
                 else: await bot.send_message(admin_id, content)
             except: pass
-    await message.answer("Отправлено.", reply_markup=main_keyboard())
-    await state.clear()
+    await message.answer("Отправлено.", reply_markup=main_keyboard()); await state.clear()
 
 @dp.callback_query(F.data == "ticket_faq")
 async def faq(callback: CallbackQuery):
@@ -997,22 +1023,20 @@ async def verify(callback: CallbackQuery):
 # --- МАГАЗИН ---
 @dp.message(F.text == "🛒 Магазин")
 async def shop(message: Message):
-    markup = InlineKeyboardMarkup(inline_keyboard=[
+    await message.answer("Магазин:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎨 Раздел профиля", callback_data="shop_profile")],
         [InlineKeyboardButton(text="🛍 Прочие товары", callback_data="shop_other")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
-    ])
-    await message.answer("Магазин:", reply_markup=markup)
+    ]))
 
 @dp.callback_query(F.data == "shop_profile")
 async def shop_profile(callback: CallbackQuery):
-    markup = InlineKeyboardMarkup(inline_keyboard=[
+    await callback.message.edit_text("Товары для профиля:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Анимированная рамка", callback_data="buy_frame")],
         [InlineKeyboardButton(text="Анимированный баннер", callback_data="buy_banner")],
         [InlineKeyboardButton(text="Цветной ник", callback_data="buy_color_nick")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")]
-    ])
-    await callback.message.edit_text("Товары для профиля:", reply_markup=markup)
+    ]))
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_item(callback: CallbackQuery):
@@ -1042,53 +1066,36 @@ async def top_players(message: Message):
     await message.answer(text)
 
 @dp.message(F.text == "📰 Новости")
-async def news(message: Message):
-    await message.answer(f"Новости: {NEWS_CHANNEL}")
+async def news(message: Message): await message.answer(f"Новости: {NEWS_CHANNEL}")
 
 @dp.message(F.text == "💬 Чат проекта")
-async def chat(message: Message):
-    await message.answer(f"Чат: {CHAT_LINK}")
+async def chat(message: Message): await message.answer(f"Чат: {CHAT_LINK}")
 
 @dp.message(F.text == "📜 Регламент проекта")
 async def reglament(message: Message):
     text = ("📜 РЕГЛАМЕНТ «404HP FACEIT»\n\n"
-            "1.1 Стороннее ПО – бан.\n"
-            "1.2 Запрос СС МС – обязателен.\n"
-            "1.3 Додж скрина – бан 3ч.\n"
-            "1.4 ПК/ноутбуки – навсегда.\n"
-            "1.5 Запись экрана – обязательна.\n"
-            "2.1 Оскорбления – бан.\n"
-            "2.2 Жалобы на админов – через тикет.\n"
-            "2.3 Выход из матча – бан 5ч.\n"
-            "2.4 Руина – бан.\n"
-            "2.5 Провокации – бан 1ч.\n"
-            "2.6 Оскорбление религии – вплоть до навсегда.")
+            "1.1 Стороннее ПО – бан.\n1.2 Запрос СС МС – обязателен.\n1.3 Додж скрина – бан 3ч.\n1.4 ПК/ноутбуки – навсегда.\n1.5 Запись экрана – обязательна.\n"
+            "2.1 Оскорбления – бан.\n2.2 Жалобы на админов – через тикет.\n2.3 Выход из матча – бан 5ч.\n2.4 Руина – бан.\n2.5 Провокации – бан 1ч.\n2.6 Оскорбление религии – вплоть до навсегда.")
     await message.answer(text)
 
 # --- АДМИН-ПАНЕЛЬ ---
 @dp.message(F.text == "🛠 Админ-панель")
 async def admin_panel(message: Message):
-    if not await is_admin(message.from_user.id):
-        await message.answer("Нет прав.")
-        return
+    if not await is_admin(message.from_user.id): await message.answer("Нет прав."); return
     await message.answer("Админ-панель", reply_markup=admin_panel_keyboard())
 
 async def _ask_nickname_for(message: Message, state: FSMContext, action: str):
-    await state.update_data(action=action)
-    await message.answer("Введи ник игрока:")
-    await state.set_state(AdminNickInput.waiting_nickname)
+    await state.update_data(action=action); await message.answer("Введи ник игрока:"); await state.set_state(AdminNickInput.waiting_nickname)
 
 async def _process_nickname(message: Message, state: FSMContext, bot: Bot):
     action = (await state.get_data()).get('action')
     nickname = message.text.strip()
     user_id = await find_user_by_nickname(nickname)
-    if not user_id:
-        await message.answer(f"Игрок с ником '{nickname}' не найден.")
-        await state.clear()
-        return
+    if not user_id: await message.answer(f"Игрок с ником '{nickname}' не найден."); await state.clear(); return
     await state.update_data(user_id=user_id)
     if action == "give_premium":
-        await _give_premium(message, state, bot, user_id)
+        await message.answer("Выберите срок премиума:", reply_markup=premium_duration_keyboard())
+        await state.set_state(AdminSelectPremiumDuration.waiting_selection)
     elif action == "remove_premium":
         await _remove_premium(message, state, bot, user_id)
     elif action == "give_verify":
@@ -1096,9 +1103,8 @@ async def _process_nickname(message: Message, state: FSMContext, bot: Bot):
     elif action == "remove_verify":
         await _remove_verify(message, state, bot, user_id)
     elif action == "ban":
-        await state.update_data(ban_user_id=user_id)
-        await message.answer("Введи причину бана:")
-        await state.set_state(AdminReasonInput.waiting_reason)
+        await message.answer("Выберите срок бана:", reply_markup=ban_duration_keyboard())
+        await state.set_state(AdminSelectBanDuration.waiting_selection)
     elif action == "unban":
         await _unban(message, state, bot, user_id)
     elif action == "add_admin":
@@ -1109,180 +1115,192 @@ async def _process_nickname(message: Message, state: FSMContext, bot: Bot):
         await _lobby_ban(message, state, bot, user_id)
     elif action == "lobby_unban":
         await _lobby_unban(message, state, bot, user_id)
-    await state.clear()
 
-async def _give_premium(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    await db_execute("UPDATE users SET premium=1 WHERE user_id=?", (user_id,))
-    await message.answer(f"✅ Премиум выдан пользователю {user_id}.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, "🎉 Вам выдан премиум статус!")
-    except: pass
-
+# --- АДМИНСКИЕ ФУНКЦИИ ---
 async def _remove_premium(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    await db_execute("UPDATE users SET premium=0 WHERE user_id=?", (user_id,))
-    await message.answer(f"✅ Премиум снят с пользователя {user_id}.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, "💔 Ваш премиум статус был снят.")
+    await db_execute("UPDATE users SET premium=0, premium_until=NULL WHERE user_id=?", (user_id,))
+    await message.answer(f"✅ Премиум снят.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "💔 Премиум снят.")
     except: pass
+    await state.clear()
 
 async def _give_verify(message: Message, state: FSMContext, bot: Bot, user_id: int):
     await db_execute("UPDATE users SET verified=1 WHERE user_id=?", (user_id,))
-    await message.answer(f"✅ Верификация выдана пользователю {user_id}.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, "✅ Вы получили верификацию! Теперь у вас галочка рядом с ником.")
+    await message.answer(f"✅ Верификация выдана.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "✅ Вы верифицированы!")
     except: pass
+    await state.clear()
 
 async def _remove_verify(message: Message, state: FSMContext, bot: Bot, user_id: int):
     await db_execute("UPDATE users SET verified=0 WHERE user_id=?", (user_id,))
-    await message.answer(f"✅ Верификация снята с пользователя {user_id}.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, "❌ Ваша верификация была снята.")
+    await message.answer(f"✅ Верификация снята.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "❌ Верификация снята.")
     except: pass
+    await state.clear()
 
 async def _unban(message: Message, state: FSMContext, bot: Bot, user_id: int):
     await db_execute("DELETE FROM bans WHERE user_id=?", (user_id,))
-    await message.answer(f"✅ Пользователь {user_id} разбанен.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, "🔓 Вы были разбанены и снова можете пользоваться ботом.")
+    await message.answer(f"✅ Разбанен.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "🔓 Вы разбанены.")
     except: pass
+    await state.clear()
 
 async def _add_admin(message: Message, state: FSMContext, bot: Bot, user_id: int):
     await db_execute("INSERT OR REPLACE INTO admins VALUES (?, 'admin')", (user_id,))
-    await message.answer(f"✅ Пользователь {user_id} назначен администратором.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, "🛡️ Вы были назначены администратором проекта 404hp FACEIT.")
+    await message.answer(f"✅ Администратор назначен.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "🛡️ Вы стали администратором.")
     except: pass
+    await state.clear()
 
 async def _remove_admin(message: Message, state: FSMContext, bot: Bot, user_id: int):
-    if user_id == message.from_user.id:
-        await message.answer("Нельзя удалить самого себя.")
-        return
+    if user_id == message.from_user.id: await message.answer("Нельзя удалить себя."); await state.clear(); return
     row = await db_fetchone("SELECT role FROM admins WHERE user_id=?", (user_id,))
-    if row and row['role'] == 'leader':
-        await message.answer("Нельзя удалить руководителя.")
-        return
+    if row and row['role'] == 'leader': await message.answer("Нельзя удалить руководителя."); await state.clear(); return
     await db_execute("DELETE FROM admins WHERE user_id=?", (user_id,))
-    await message.answer(f"✅ Пользователь {user_id} снят с должности администратора.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, "⚠️ Вы были сняты с должности администратора.")
+    await message.answer(f"✅ Администратор снят.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "⚠️ Вы больше не администратор.")
     except: pass
+    await state.clear()
 
 async def _lobby_ban(message: Message, state: FSMContext, bot: Bot, user_id: int):
     await db_execute("UPDATE users SET can_create_lobby=0 WHERE user_id=?", (user_id,))
-    await message.answer(f"⛔ Пользователю {user_id} запрещено создавать лобби.", reply_markup=main_keyboard())
+    await message.answer(f"⛔ Запрещено создавать лобби.", reply_markup=main_keyboard())
     try: await bot.send_message(user_id, "⛔ Вам запретили создавать лобби.")
     except: pass
+    await state.clear()
 
 async def _lobby_unban(message: Message, state: FSMContext, bot: Bot, user_id: int):
     await db_execute("UPDATE users SET can_create_lobby=1 WHERE user_id=?", (user_id,))
-    await message.answer(f"✅ Пользователю {user_id} снова разрешено создавать лобби.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, "✅ Вам снова разрешено создавать лобби.")
+    await message.answer(f"✅ Разрешено создавать лобби.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, "✅ Вам снова можно создавать лобби.")
     except: pass
+    await state.clear()
 
+# --- CALLBACKS АДМИНКИ ---
 @dp.callback_query(F.data == "admin_give_premium")
 async def give_premium_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "give_premium")
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "give_premium")
 
 @dp.callback_query(F.data == "admin_remove_premium")
 async def remove_premium_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "remove_premium")
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "remove_premium")
 
 @dp.callback_query(F.data == "admin_give_verify")
 async def give_verify_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "give_verify")
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "give_verify")
 
 @dp.callback_query(F.data == "admin_remove_verify")
 async def remove_verify_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "remove_verify")
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "remove_verify")
 
 @dp.callback_query(F.data == "admin_ban")
 async def ban_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "ban")
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "ban")
 
 @dp.callback_query(F.data == "admin_unban")
 async def unban_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "unban")
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "unban")
 
 @dp.callback_query(F.data == "admin_add_admin")
 async def add_admin_cb(callback: CallbackQuery, state: FSMContext):
-    if not await is_leader(callback.from_user.id):
-        await callback.answer("Только руководитель.", show_alert=True)
-        return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "add_admin")
+    if not await is_leader(callback.from_user.id): await callback.answer("Только руководитель.", show_alert=True); return
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "add_admin")
 
 @dp.callback_query(F.data == "admin_remove_admin")
 async def remove_admin_cb(callback: CallbackQuery, state: FSMContext):
-    if not await is_leader(callback.from_user.id):
-        await callback.answer("Только руководитель.", show_alert=True)
-        return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "remove_admin")
+    if not await is_leader(callback.from_user.id): await callback.answer("Только руководитель.", show_alert=True); return
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "remove_admin")
 
 @dp.callback_query(F.data == "admin_lobby_ban")
 async def lobby_ban_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "lobby_ban")
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "lobby_ban")
 
 @dp.callback_query(F.data == "admin_lobby_unban")
 async def lobby_unban_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await _ask_nickname_for(callback.message, state, "lobby_unban")
+    await callback.message.delete(); await _ask_nickname_for(callback.message, state, "lobby_unban")
 
 @dp.message(AdminNickInput.waiting_nickname)
 async def admin_nickname_handler(message: Message, state: FSMContext, bot: Bot):
     await _process_nickname(message, state, bot)
 
-@dp.message(AdminReasonInput.waiting_reason)
-async def admin_reason_handler(message: Message, state: FSMContext):
-    await state.update_data(reason=message.text)
-    await message.answer("Введи срок бана (часов или 'permanent'):")
-    await state.set_state(AdminDurationInput.waiting_duration)
+# --- ВЫБОР СРОКА БАНА ---
+@dp.callback_query(AdminSelectBanDuration.waiting_selection)
+async def ban_duration_selected(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = callback.data
+    if data == "main_menu": await go_main_menu_cb(callback, state); return
+    duration_map = {
+        "ban_10m": timedelta(minutes=10), "ban_30m": timedelta(minutes=30),
+        "ban_1h": timedelta(hours=1), "ban_1d": timedelta(days=1),
+        "ban_1w": timedelta(weeks=1), "ban_1mo": timedelta(days=30),
+        "ban_1y": timedelta(days=365), "ban_forever": "permanent"
+    }
+    duration = duration_map.get(data)
+    if not duration: await callback.answer("Неверный выбор."); return
+    until_str = "permanent" if duration == "permanent" else (datetime.now() + duration).isoformat()
+    await state.update_data(ban_duration=until_str, ban_duration_label=data)
+    await callback.message.edit_text("Введите причину бана:")
+    await state.set_state(AdminReasonInput.waiting_reason)
+    await callback.answer()
 
-@dp.message(AdminDurationInput.waiting_duration)
-async def admin_duration_handler(message: Message, state: FSMContext, bot: Bot):
+@dp.message(AdminReasonInput.waiting_reason)
+async def ban_reason_entered(message: Message, state: FSMContext, bot: Bot):
+    reason = message.text
     data = await state.get_data()
-    user_id = data['ban_user_id']
-    reason = data['reason']
-    dur = message.text.lower()
-    if dur == "permanent":
-        until = "permanent"
-    else:
-        try:
-            hours = int(dur)
-            until = (datetime.now() + timedelta(hours=hours)).isoformat()
-        except:
-            await message.answer("Неверный формат. Введите число часов или 'permanent'.")
-            return
-    await db_execute("INSERT OR REPLACE INTO bans VALUES (?,?,?)", (user_id, reason, until))
-    await message.answer(f"✅ Пользователь {user_id} забанен до {until}.", reply_markup=main_keyboard())
-    try: await bot.send_message(user_id, f"🚫 Вы были забанены. Причина: {reason}. Срок: {until}")
+    user_id, until_str, label = data['user_id'], data['ban_duration'], data.get('ban_duration_label','')
+    await db_execute("INSERT OR REPLACE INTO bans (user_id, reason, banned_until) VALUES (?,?,?)", (user_id, reason, until_str))
+    admin_acc = await db_get_account(message.from_user.id)
+    admin_nick = admin_acc['nickname'] if admin_acc else str(message.from_user.id)
+    target_acc = await db_get_account(user_id)
+    target_nick = target_acc['nickname'] if target_acc else str(user_id)
+    duration_text = {
+        "ban_10m":"10 минут","ban_30m":"30 минут","ban_1h":"1 час","ban_1d":"1 день",
+        "ban_1w":"1 неделя","ban_1mo":"1 месяц","ban_1y":"1 год","ban_forever":"Навсегда"
+    }.get(label, until_str)
+    channel_post = (f"❌ Забанен игрок\n————————\n🛡️ Администратор: {admin_nick}\n⛓️ Забанил: {target_nick}\nℹ️ Причина: {reason}\n🕓 Время бана: {duration_text}\n————————\n🎮 404hp FACEIT | @faceit404hpbot")
+    try: await bot.send_message(chat_id=CHANNEL_USERNAME, text=channel_post)
+    except: pass
+    await message.answer(f"✅ Игрок {user_id} забанен до {until_str}.", reply_markup=main_keyboard())
+    try: await bot.send_message(user_id, f"🚫 Вы забанены. Причина: {reason}. Срок: {duration_text}")
     except: pass
     await state.clear()
 
+# --- ВЫБОР СРОКА ПРЕМИУМА ---
+@dp.callback_query(AdminSelectPremiumDuration.waiting_selection)
+async def premium_duration_selected(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    data = callback.data
+    if data == "main_menu": await go_main_menu_cb(callback, state); return
+    duration_map = {"prem_1mo": timedelta(days=30), "prem_1y": timedelta(days=365)}
+    duration = duration_map.get(data)
+    if not duration: await callback.answer("Неверный выбор."); return
+    until = datetime.now() + duration
+    user_id = (await state.get_data())['user_id']
+    await db_execute("UPDATE users SET premium=1, premium_until=? WHERE user_id=?", (until.isoformat(), user_id))
+    await callback.message.edit_text(f"✅ Премиум выдан пользователю {user_id} до {until.strftime('%d.%m.%Y')}.")
+    try: await bot.send_message(user_id, "🎉 Вам выдан премиум!")
+    except: pass
+    await state.clear()
+
+# --- ОСТАЛЬНЫЕ АДМИНСКИЕ CALLBACKS (тест, тикеты) ---
 @dp.callback_query(F.data == "admin_test_shuffle")
 async def test_shuffle_cb(callback: CallbackQuery, state: FSMContext):
     if not await is_admin(callback.from_user.id): return
-    await callback.message.delete()
-    await callback.message.answer("Введи ID лобби для тестовой жеребьёвки:")
-    await state.set_state(AdminTestShuffle.waiting_lobby_id)
+    await callback.message.delete(); await callback.message.answer("Введи ID лобби:"); await state.set_state(AdminTestShuffle.waiting_lobby_id)
 
 @dp.message(AdminTestShuffle.waiting_lobby_id)
 async def test_shuffle_process(message: Message, state: FSMContext, bot: Bot):
     lid = int(message.text)
     lobby = await db_fetchone("SELECT host_id, format, map FROM lobbies WHERE id=?", (lid,))
-    if not lobby:
-        await message.answer("Лобби не найдено."); await state.clear(); return
+    if not lobby: await message.answer("Лобби не найдено."); await state.clear(); return
     players = [r['user_id'] for r in await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?",(lid,))]
-    if len(players) < 2:
-        await message.answer("⚠️ Мало игроков."); await state.clear(); return
+    if len(players) < 2: await message.answer("Мало игроков."); await state.clear(); return
     random.shuffle(players); half = len(players)//2
     for u in players[:half]: await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?",(lid,u))
     for u in players[half:]: await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?",(lid,u))
@@ -1295,46 +1313,38 @@ async def test_shuffle_process(message: Message, state: FSMContext, bot: Bot):
             await message.answer_photo(FSInputFile(path), caption="Тестовая жеребьёвка")
             os.unlink(path)
     except: pass
-    await message.answer("✅ Готово.", reply_markup=main_keyboard())
-    await state.clear()
+    await message.answer("✅ Готово.", reply_markup=main_keyboard()); await state.clear()
 
 @dp.callback_query(F.data == "admin_review_ticket")
 async def review_tickets_cb(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id): return
     tickets = await db_fetchall("SELECT id, user_id, type, content FROM tickets WHERE status='open' LIMIT 10")
-    if not tickets:
-        await callback.message.edit_text("Нет открытых тикетов.", reply_markup=back_to_menu())
-        return
+    if not tickets: await callback.message.edit_text("Нет открытых тикетов.", reply_markup=back_to_menu()); return
     text = "📋 Открытые тикеты:\n"
-    for t in tickets:
-        text += f"#{t['id']} от {t['user_id']} ({t['type']}): {t['content'][:100]}...\n\n"
-    markup = InlineKeyboardMarkup(inline_keyboard=[
+    for t in tickets: text += f"#{t['id']} от {t['user_id']} ({t['type']}): {t['content'][:100]}...\n\n"
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Закрыть тикет", callback_data="admin_close_ticket")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel_back")]
-    ])
-    await callback.message.edit_text(text, reply_markup=markup)
+    ]))
 
 @dp.callback_query(F.data == "admin_close_ticket")
 async def close_ticket_cb(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введи номер тикета:")
-    await state.set_state(AdminTicketReview.waiting_ticket_id)
+    await callback.message.answer("Введи номер тикета:"); await state.set_state(AdminTicketReview.waiting_ticket_id)
 
 @dp.message(AdminTicketReview.waiting_ticket_id)
 async def close_ticket_process(message: Message, state: FSMContext):
     if not message.text.isdigit(): await message.answer("Число."); return
-    tid = int(message.text)
-    await db_execute("UPDATE tickets SET status='closed' WHERE id=?", (tid,))
-    await message.answer(f"Тикет #{tid} закрыт.", reply_markup=main_keyboard())
-    await state.clear()
+    await db_execute("UPDATE tickets SET status='closed' WHERE id=?", (int(message.text),))
+    await message.answer("✅ Тикет закрыт.", reply_markup=main_keyboard()); await state.clear()
 
 @dp.callback_query(F.data == "admin_panel_back")
-async def back_admin_cb(callback: CallbackQuery):
-    await callback.message.edit_text("Админ-панель", reply_markup=admin_panel_keyboard())
+async def back_admin_cb(callback: CallbackQuery): await callback.message.edit_text("Админ-панель", reply_markup=admin_panel_keyboard())
 
 @dp.callback_query(F.data == "main_menu")
-async def go_main_menu_cb(callback: CallbackQuery):
+async def go_main_menu_cb(callback: CallbackQuery, state: FSMContext = None):
     await callback.message.delete()
     await callback.message.answer("Главное меню", reply_markup=main_keyboard())
+    if state: await state.clear()
 
 # ==================== ЗАПУСК ====================
 async def main():
