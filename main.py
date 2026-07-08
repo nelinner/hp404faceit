@@ -7,7 +7,7 @@ import tempfile
 import traceback
 from datetime import datetime, timedelta
 from io import BytesIO
-from contextlib import suppress
+from difflib import SequenceMatcher
 
 from playwright.async_api import async_playwright
 from PIL import Image
@@ -23,7 +23,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramRetryAfter
 
 # ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = "8254209430:AAE78X4Dli5kutcpFwEXJOXfEslx_GCJjuw"
@@ -68,7 +67,9 @@ def init_db():
             user_id INTEGER PRIMARY KEY,
             nickname TEXT,
             game_id TEXT,
-            elo INTEGER DEFAULT 1000,
+            elo_5x5 INTEGER DEFAULT 1000,
+            elo_2x2 INTEGER DEFAULT 1000,
+            elo_1x1 INTEGER DEFAULT 1000,
             can_create_lobby INTEGER DEFAULT 1,
             premium_until TEXT
         );
@@ -133,6 +134,11 @@ def init_db():
             conn.execute(f"ALTER TABLE users ADD COLUMN {col} {col_def}")
         except sqlite3.OperationalError:
             pass
+    for col in ["elo_5x5", "elo_2x2", "elo_1x1"]:
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 1000")
+        except sqlite3.OperationalError:
+            pass
     try:
         conn.execute("ALTER TABLE users ADD COLUMN premium_until TEXT")
     except sqlite3.OperationalError:
@@ -164,6 +170,20 @@ async def db_fetchall(sql: str, params: tuple = ()) -> list:
         return [dict(r) for r in rows]
     return await asyncio.to_thread(_fetch)
 
+# ==================== ПРОВЕРКА ПОХОЖИХ НИКОВ ====================
+async def is_nickname_similar(new_nick: str) -> bool:
+    rows = await db_fetchall("SELECT nickname FROM users")
+    for row in rows:
+        existing = row['nickname'].lower()
+        new = new_nick.lower()
+        if existing == new:
+            return True
+        if abs(len(existing) - len(new)) > 3:
+            continue
+        if SequenceMatcher(None, existing, new).ratio() > 0.8:
+            return True
+    return False
+
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 async def check_subscription(bot: Bot, user_id: int) -> bool:
     try:
@@ -172,13 +192,17 @@ async def check_subscription(bot: Bot, user_id: int) -> bool:
     except:
         return False
 
-async def get_elo_rank(user_id: int) -> tuple:
-    row = await db_fetchone("SELECT elo FROM users WHERE user_id = ?", (user_id,))
+async def get_total_elo(user_id: int) -> int:
+    row = await db_fetchone("SELECT elo_5x5, elo_2x2, elo_1x1 FROM users WHERE user_id = ?", (user_id,))
     if not row:
-        return 0, 0
-    elo = row['elo']
-    cnt = await db_fetchone("SELECT COUNT(*) as cnt FROM users WHERE elo > ?", (elo,))
-    return elo, cnt['cnt'] + 1
+        return 0
+    return row['elo_5x5'] + row['elo_2x2'] + row['elo_1x1']
+
+async def get_elo_rank(user_id: int) -> tuple:
+    total = await get_total_elo(user_id)
+    row = await db_fetchone("SELECT COUNT(*) as cnt FROM users WHERE (elo_5x5+elo_2x2+elo_1x1) > ?", (total,))
+    rank = row['cnt'] + 1 if row else 1
+    return total, rank
 
 async def is_admin(user_id: int) -> bool:
     return await db_fetchone("SELECT role FROM admins WHERE user_id = ?", (user_id,)) is not None
@@ -216,7 +240,7 @@ async def db_get_account(user_id: int) -> dict | None:
     return await db_fetchone("SELECT nickname, game_id FROM users WHERE user_id=?", (user_id,))
 
 async def db_get_player(user_id: int) -> dict | None:
-    return await db_fetchone("SELECT elo, kills, deaths, matches_played, premium, verified, premium_until FROM users WHERE user_id=?", (user_id,))
+    return await db_fetchone("SELECT elo_5x5, elo_2x2, elo_1x1, kills, deaths, matches_played, premium, verified, premium_until FROM users WHERE user_id=?", (user_id,))
 
 async def is_premium(user_id: int) -> bool:
     row = await db_fetchone("SELECT premium, premium_until FROM users WHERE user_id=?", (user_id,))
@@ -325,6 +349,10 @@ def generate_profile_html(player: dict, acc: dict) -> str:
     status = "PREMIUM" if premium else "STANDARD"
     status_color = "text-yellow-400" if premium else "text-blue-400"
 
+    elo_5 = player.get('elo_5x5', 1000)
+    elo_2 = player.get('elo_2x2', 1000)
+    elo_1 = player.get('elo_1x1', 1000)
+
     return f'''<!DOCTYPE html>
 <html lang="ru">
 <head>
@@ -338,7 +366,7 @@ def generate_profile_html(player: dict, acc: dict) -> str:
             <div class="w-32 h-32 bg-gray-700 rounded-2xl flex items-center justify-center text-5xl">👤</div>
             <div>
                 <h1 class="text-5xl font-bold">{nick_text}</h1>
-                <p class="text-gray-400">ID: {acc['game_id']} | ELO: {player.get('elo',0)}</p>
+                <p class="text-gray-400">ID: {acc['game_id']}</p>
                 <p class="{status_color} text-xl mt-2 font-bold">{status}</p>
                 <div class="mt-4 text-6xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-pink-500 to-blue-500">{kd:.2f}</div>
                 <p class="text-gray-400">K/D Ratio | K={player.get('kills',0)} D={player.get('deaths',0)}</p>
@@ -350,6 +378,12 @@ def generate_profile_html(player: dict, acc: dict) -> str:
                 <p>⚔️ K/D: {kd:.2f}</p><p>💀 Убийств: {player.get('kills',0)}</p>
                 <p>🛡️ Смертей: {player.get('deaths',0)}</p><p>🎮 Матчей: {player.get('matches_played',0)}</p>
                 <p>⭐ Premium: {"Да" if premium else "Нет"}</p><p>✅ Верификация: {"Да" if verified else "Нет"}</p>
+            </div>
+            <div class="mt-6">
+                <h3 class="text-xl font-bold mb-2">🏆 Рейтинг по режимам</h3>
+                <p>5x5: {elo_5} ELO</p>
+                <p>2x2: {elo_2} ELO</p>
+                <p>1x1: {elo_1} ELO</p>
             </div>
         </div>
         <p class="text-center text-gray-500 mt-6">404hp FACEIT © 2026</p>
@@ -403,7 +437,8 @@ async def generate_lobby_image(lobby: dict, bot: Bot) -> Image.Image:
         player = await db_get_player(uid)
         if acc:
             role = "ADMIN" if await is_admin(uid) else "ИГРОК"
-            players.append({"name": acc['nickname'], "id": acc['game_id'], "role": role, "elo": player.get('elo','—') if player else '—'})
+            total_elo = player['elo_5x5']+player['elo_2x2']+player['elo_1x1'] if player else '—'
+            players.append({"name": acc['nickname'], "id": acc['game_id'], "role": role, "elo": total_elo})
     host_acc = await db_get_account(lobby.get('host_id'))
     host_name = host_acc['nickname'] if host_acc else str(lobby.get('host_id'))
     progress = int((len(players) / 10) * 100) if lobby.get('format') == '5x5' else 50
@@ -421,10 +456,15 @@ async def generate_draft_image(lobby: dict, bot: Bot) -> Image.Image:
         acc = await db_get_account(uid)
         player = await db_get_player(uid)
         if not acc: continue
+        total_elo = player['elo_5x5']+player['elo_2x2']+player['elo_1x1'] if player else 0
         pinfo = {"name": acc['nickname'], "matches": player.get('matches_played',0) if player else 0,
                  "kd": player['kills']/max(1,player['deaths']) if player else 0}
-        if side == "CT": ct_players.append(pinfo); ct_elo += player.get('elo',0) if player else 0
-        else: t_players.append(pinfo); t_elo += player.get('elo',0) if player else 0
+        if side == "CT":
+            ct_players.append(pinfo)
+            ct_elo += total_elo
+        else:
+            t_players.append(pinfo)
+            t_elo += total_elo
     html = generate_draft_html({"ct_players":ct_players, "t_players":t_players, "ct_elo":ct_elo, "t_elo":t_elo})
     return await html_to_image(html)
 
@@ -488,7 +528,7 @@ def main_keyboard():
     for b in ["👤 Профиль","🔍 Найти матч","➕ Создать матч","🎮 Мои лобби",
               "🎟 Тикет поддержки","🛒 Магазин",
               "🏆 Топ игроков FACEIT","📰 Новости","💬 Чат проекта",
-              "📜 Регламент проекта","🛠 Админ-панель","🖼 Установить аватар"]:
+              "📜 Регламент проекта","🛠 Админ-панель"]:
         builder.button(text=b)
     builder.adjust(2)
     return builder.as_markup(resize_keyboard=True)
@@ -565,30 +605,45 @@ async def start_registration(message: Message, state: FSMContext):
 
 @dp.message(RegStates.waiting_nickname)
 async def reg_nickname(message: Message, state: FSMContext):
-    await state.update_data(nickname=message.text)
+    nick = message.text.strip()
+    if len(nick) < 3:
+        await message.answer("Ник должен быть не менее 3 символов."); return
+    if len(nick) > 20:
+        await message.answer("Ник должен быть не более 20 символов."); return
+    if await is_nickname_similar(nick):
+        await message.answer("❌ Этот ник (или очень похожий) уже занят. Придумайте другой."); return
+    await state.update_data(nickname=nick)
     await message.answer("Введи игровой ID (число):"); await state.set_state(RegStates.waiting_game_id)
 
 @dp.message(RegStates.waiting_game_id)
 async def reg_game_id(message: Message, state: FSMContext):
     if not message.text.isdigit(): await message.answer("ID должен быть числом."); return
-    await state.update_data(game_id=message.text)
-    await message.answer(f"Ник: {(await state.get_data())['nickname']}\nID: {message.text}\nПодтвердить?",
+    game_id = message.text.strip()
+    if len(game_id) < 5:
+        await message.answer("ID должен содержать минимум 5 цифр."); return
+    await state.update_data(game_id=game_id)
+    data = await state.get_data()
+    await message.answer(f"Ник: {data['nickname']}\nID: {game_id}\nВсё верно?",
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                             [InlineKeyboardButton(text="✅ Да", callback_data="confirm_reg")],
-                             [InlineKeyboardButton(text="❌ Нет", callback_data="cancel_reg")]
+                             [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_reg")],
+                             [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_reg")]
                          ]))
     await state.set_state(RegStates.confirm)
 
 @dp.callback_query(RegStates.confirm, F.data == "confirm_reg")
 async def reg_confirm(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    await db_execute("INSERT OR REPLACE INTO users VALUES (?,?,?,1000)", (callback.from_user.id, data['nickname'], data['game_id']))
-    await callback.message.delete(); await callback.message.answer("✅ Регистрация завершена!", reply_markup=main_keyboard())
+    await db_execute(
+        "INSERT OR REPLACE INTO users (user_id, nickname, game_id, elo_5x5, elo_2x2, elo_1x1) VALUES (?,?,?,1000,1000,1000)",
+        (callback.from_user.id, data['nickname'], data['game_id'])
+    )
+    await callback.message.delete()
+    await callback.message.answer("✅ Регистрация завершена!", reply_markup=main_keyboard())
     await state.clear()
 
 @dp.callback_query(F.data == "cancel_reg")
 async def reg_cancel(callback: CallbackQuery, state: FSMContext):
-    await callback.message.delete(); await callback.message.answer("Отменено."); await state.clear()
+    await callback.message.delete(); await callback.message.answer("Регистрация отменена."); await state.clear()
 
 # --- ПРОФИЛЬ ---
 @dp.message(F.text == "👤 Профиль")
@@ -600,19 +655,30 @@ async def profile(message: Message, bot: Bot):
     try:
         img = await generate_profile_image(player, acc, bot)
         path = save_image_temp(img)
-        elo, rank = await get_elo_rank(user_id)
+        total_elo, rank = await get_elo_rank(user_id)
         kd = player.get('kills',0)/max(1,player.get('deaths',1))
         premium = await is_premium(user_id)
         verified = await is_verified(user_id)
-        await message.answer_photo(FSInputFile(path), caption=f"🪪 {acc['nickname']}\n🔗 ID: {acc['game_id']}\n🔫 K/D: {kd:.2f}\n🏆 Место: #{rank}\n⭐ Premium: {'✅' if premium else '❌'}\n✊ ELO: {elo}\n✅ Верификация: {'✅' if verified else '❌'}")
+        caption = (f"🪪 {acc['nickname']}\n"
+                   f"🔗 ID: {acc['game_id']}\n"
+                   f"🔫 K/D: {kd:.2f}\n"
+                   f"🏆 Общий рейтинг: #{rank} (всего ELO: {total_elo})\n"
+                   f"⭐ Premium: {'✅' if premium else '❌'}\n"
+                   f"✅ Верификация: {'✅' if verified else '❌'}\n"
+                   f"🎮 5x5: {player.get('elo_5x5',0)} | 2x2: {player.get('elo_2x2',0)} | 1x1: {player.get('elo_1x1',0)}")
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🖼 Установить аватар", callback_data="upload_avatar")]
+        ])
+        await message.answer_photo(FSInputFile(path), caption=caption, reply_markup=markup)
         os.unlink(path)
     except Exception as e:
         logging.error(f"Ошибка профиля: {e}"); await message.answer("Ошибка создания карточки.")
 
-@dp.message(F.text == "🖼 Установить аватар")
-async def set_avatar_start(message: Message, state: FSMContext):
-    await message.answer("Отправьте изображение для аватара.")
+@dp.callback_query(F.data == "upload_avatar")
+async def upload_avatar_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Отправьте изображение для аватара (квадратное фото).")
     await state.set_state(AvatarUpload.waiting_photo)
+    await callback.answer()
 
 @dp.message(AvatarUpload.waiting_photo, F.photo)
 async def avatar_photo_handler(message: Message, state: FSMContext):
@@ -675,7 +741,7 @@ async def result_from_mylobby(callback: CallbackQuery, state: FSMContext):
     lobby = await db_fetchone("SELECT * FROM lobbies WHERE id=?", (lobby_id,))
     if not lobby or lobby['host_id'] != callback.from_user.id or lobby['status'] != 'in_progress':
         await callback.answer("Матч не начат или уже завершён.", show_alert=True); return
-    await state.update_data(lobby_id=lobby_id, host_id=lobby['host_id'], map_name=lobby['map'])
+    await state.update_data(lobby_id=lobby_id, host_id=lobby['host_id'], map_name=lobby['map'], format=lobby['format'])
     await callback.message.answer("Пришлите скриншот результатов:")
     await state.set_state(ResultStates.waiting_screenshot)
     await callback.answer()
@@ -839,7 +905,7 @@ async def results_lobby_id(message: Message, state: FSMContext):
     lobby = await db_fetchone("SELECT * FROM lobbies WHERE id=?", (lid,))
     if not lobby: await message.answer("Лобби не найдено."); return
     if lobby['status'] != 'in_progress': await message.answer("Матч не начат или завершён."); return
-    await state.update_data(lobby_id=lid, host_id=lobby['host_id'], map_name=lobby['map'])
+    await state.update_data(lobby_id=lid, host_id=lobby['host_id'], map_name=lobby['map'], format=lobby['format'])
     await message.answer("Пришлите скриншот результатов:")
     await state.set_state(ResultStates.waiting_screenshot)
 
@@ -868,16 +934,17 @@ async def results_score(message: Message, state: FSMContext, bot: Bot):
 async def results_swap(callback: CallbackQuery, state: FSMContext, bot: Bot):
     swapped = callback.data == "swap_yes"
     data = await state.get_data()
-    lid, ct_score, t_score, screenshot, host_id, map_name = data['lobby_id'], data['ct_score'], data['t_score'], data['screenshot'], data['host_id'], data['map_name']
+    lid, ct_score, t_score, screenshot, host_id, map_name, fmt = data['lobby_id'], data['ct_score'], data['t_score'], data['screenshot'], data['host_id'], data['map_name'], data['format']
     winner = "CT" if ct_score > t_score else "T"
     winner_team = 1 if winner == "CT" else 2
+    elo_field = f"elo_{fmt}"
     players = await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?", (lid,))
     for p in players:
         uid = p['user_id']
         player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
         actual_team = 2 if (player_team == 1 and swapped) or (player_team == 2 and not swapped) else player_team
         if actual_team == winner_team:
-            await db_execute("UPDATE users SET elo=elo+25, matches_played=matches_played+1 WHERE user_id=?", (uid,))
+            await db_execute(f"UPDATE users SET {elo_field}=elo_{fmt}+25, matches_played=matches_played+1 WHERE user_id=?", (uid,))
         else:
             await db_execute("UPDATE users SET matches_played=matches_played+1 WHERE user_id=?", (uid,))
     ct_list, t_list = [], []
@@ -885,7 +952,8 @@ async def results_swap(callback: CallbackQuery, state: FSMContext, bot: Bot):
         uid = p['user_id']; acc = await db_get_account(uid)
         player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
         actual_team = 2 if (player_team == 1 and swapped) or (player_team == 2 and not swapped) else player_team
-        elo = (await db_get_player(uid))['elo'] if await db_get_player(uid) else 0
+        player = await db_get_player(uid)
+        elo = player[elo_field] if player else 0
         (ct_list if actual_team == 1 else t_list).append(f"{len(ct_list if actual_team==1 else t_list)+1}. {acc['nickname']} (ELO: {elo})")
     await db_execute("INSERT INTO matches (lobby_id, host_id, map, ct_score, t_score, teams_swapped, screenshot_id) VALUES (?,?,?,?,?,?,?)",
                      (lid, host_id, map_name, ct_score, t_score, int(swapped), screenshot))
@@ -1054,16 +1122,17 @@ async def shop_other(callback: CallbackQuery):
 # --- ТОП ---
 @dp.message(F.text == "🏆 Топ игроков FACEIT")
 async def top_players(message: Message):
-    top5 = await db_fetchall("SELECT user_id, nickname, elo FROM users ORDER BY elo DESC LIMIT 5")
+    top5 = await db_fetchall("SELECT user_id, nickname, elo_5x5, elo_2x2, elo_1x1 FROM users ORDER BY (elo_5x5+elo_2x2+elo_1x1) DESC LIMIT 5")
     medals = ["🥇","🥈","🥉","🏆","🏆"]
     text = "🏆 Топ FACEIT:\n"
     for i, row in enumerate(top5):
-        text += f"{medals[i]} {row['nickname']} : {row['elo']} ELO | TOP {i+1}\n"
+        total = row['elo_5x5'] + row['elo_2x2'] + row['elo_1x1']
+        text += f"{medals[i]} {row['nickname']} : {total} ELO | TOP {i+1}\n"
     text += "————————————————\n"
-    elo, rank = await get_elo_rank(message.from_user.id)
+    total_elo, rank = await get_elo_rank(message.from_user.id)
     user = await db_fetchone("SELECT nickname FROM users WHERE user_id=?", (message.from_user.id,))
     if user:
-        text += f"🔎 Твоё место: #{rank}\n🪪 {user['nickname']}\n🔫 ELO: {elo}"
+        text += f"🔎 Твоё место: #{rank}\n🪪 {user['nickname']}\n🔫 ELO: {total_elo}"
     else:
         text += "Ты не зарегистрирован."
     await message.answer(text)
@@ -1119,7 +1188,6 @@ async def _process_nickname(message: Message, state: FSMContext, bot: Bot):
     elif action == "lobby_unban":
         await _lobby_unban(message, state, bot, user_id)
 
-# --- АДМИНСКИЕ ФУНКЦИИ ---
 async def _remove_premium(message: Message, state: FSMContext, bot: Bot, user_id: int):
     await db_execute("UPDATE users SET premium=0, premium_until=NULL WHERE user_id=?", (user_id,))
     await message.answer(f"✅ Премиум снят.", reply_markup=main_keyboard())
