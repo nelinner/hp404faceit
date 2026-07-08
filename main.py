@@ -892,7 +892,7 @@ async def find_match(message: Message):
             [InlineKeyboardButton(text="🔙 Выйти", callback_data=f"leave_{lid}")]
         ]))
 
-# --- РЕЗУЛЬТАТЫ ---
+# --- РЕЗУЛЬТАТЫ (с двойным ELO для премиума) ---
 @dp.message(Command("results"))
 async def results_start(message: Message, state: FSMContext):
     await message.answer("Введите номер лобби:")
@@ -943,8 +943,10 @@ async def results_swap(callback: CallbackQuery, state: FSMContext, bot: Bot):
         uid = p['user_id']
         player_team = (await db_fetchone("SELECT team FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)))['team']
         actual_team = 2 if (player_team == 1 and swapped) or (player_team == 2 and not swapped) else player_team
+        premium = await is_premium(uid)
+        bonus = 50 if premium else 25
         if actual_team == winner_team:
-            await db_execute(f"UPDATE users SET {elo_field}=elo_{fmt}+25, matches_played=matches_played+1 WHERE user_id=?", (uid,))
+            await db_execute(f"UPDATE users SET {elo_field}=elo_{fmt}+?, matches_played=matches_played+1 WHERE user_id=?", (bonus, uid))
         else:
             await db_execute("UPDATE users SET matches_played=matches_played+1 WHERE user_id=?", (uid,))
     ct_list, t_list = [], []
