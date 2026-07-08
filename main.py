@@ -7,6 +7,7 @@ import tempfile
 import traceback
 from datetime import datetime, timedelta
 from io import BytesIO
+from contextlib import suppress
 
 from playwright.async_api import async_playwright
 from PIL import Image
@@ -21,6 +22,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramRetryAfter
 
 # ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = "8342407843:AAGi_e-DmYarz8DsVWxqKs1O3xGS7mbh5Oo"
@@ -1349,7 +1352,7 @@ async def go_main_menu_cb(callback: CallbackQuery, state: FSMContext = None):
 # ==================== ЗАПУСК ====================
 async def main():
     init_db()
-    bot = Bot(token=BOT_TOKEN)
+    bot = Bot(token=BOT_TOKEN, session=AiohttpSession())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
