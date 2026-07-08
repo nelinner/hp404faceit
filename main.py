@@ -26,7 +26,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramRetryAfter
 
 # ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = "8342407843:AAGi_e-DmYarz8DsVWxqKs1O3xGS7mbh5Oo"
+BOT_TOKEN = "8254209430:AAE78X4Dli5kutcpFwEXJOXfEslx_GCJjuw"
 CHANNEL_USERNAME = "@testhp404bot"
 SHOP_BOT = "@hp404shopbot"
 CHAT_LINK = "https://t.me/hpfaceitchat"
@@ -1352,8 +1352,12 @@ async def go_main_menu_cb(callback: CallbackQuery, state: FSMContext = None):
 # ==================== ЗАПУСК ====================
 async def main():
     init_db()
-    bot = Bot(token=BOT_TOKEN, session=AiohttpSession())
-    await dp.start_polling(bot)
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=AiohttpSession(),
+        request_timeout=30
+    )
+    await dp.start_polling(bot, polling_timeout=30, handle_as_tasks=False)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
