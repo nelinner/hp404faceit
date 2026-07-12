@@ -3,11 +3,8 @@ import logging
 import random
 import sqlite3
 import os
-import tempfile
-import traceback
 import hashlib
 from datetime import datetime, timedelta
-from io import BytesIO
 from difflib import SequenceMatcher
 
 from aiogram import Bot, Dispatcher, F
@@ -53,10 +50,10 @@ def init_db():
             game_id TEXT,
             password_hash TEXT,
             is_logged_in INTEGER DEFAULT 0,
-            elo_5x5 INTEGER DEFAULT 1000,
-            elo_2x2 INTEGER DEFAULT 1000,
-            elo_1x1 INTEGER DEFAULT 1000,
-            can_create_lobby INTEGER DEFAULT 1,
+            elo_5x5 INTEGER DEFAULT 0,
+            elo_2x2 INTEGER DEFAULT 0,
+            elo_1x1 INTEGER DEFAULT 0,
+            can_create_lobby INTEGER DEFAULT 0,
             premium_until TEXT,
             premium INTEGER DEFAULT 0,
             verified INTEGER DEFAULT 0,
@@ -114,17 +111,16 @@ def init_db():
     conn.close()
 
 async def run_migrations():
-    # Эталонный список столбцов таблицы users (имя, тип)
     expected_columns = {
         "user_id": "INTEGER PRIMARY KEY",
         "nickname": "TEXT UNIQUE",
         "game_id": "TEXT",
         "password_hash": "TEXT",
         "is_logged_in": "INTEGER DEFAULT 0",
-        "elo_5x5": "INTEGER DEFAULT 1000",
-        "elo_2x2": "INTEGER DEFAULT 1000",
-        "elo_1x1": "INTEGER DEFAULT 1000",
-        "can_create_lobby": "INTEGER DEFAULT 1",
+        "elo_5x5": "INTEGER DEFAULT 0",
+        "elo_2x2": "INTEGER DEFAULT 0",
+        "elo_1x1": "INTEGER DEFAULT 0",
+        "can_create_lobby": "INTEGER DEFAULT 0",
         "premium_until": "TEXT",
         "premium": "INTEGER DEFAULT 0",
         "verified": "INTEGER DEFAULT 0",
@@ -138,7 +134,6 @@ async def run_migrations():
         existing_info = await db_fetchall("PRAGMA table_info(users)")
         existing_columns = {row['name'] for row in existing_info}
     except:
-        # Таблицы users ещё нет — ничего не делаем
         return
 
     for col_name, col_def in expected_columns.items():
@@ -149,29 +144,51 @@ async def run_migrations():
             except Exception as e:
                 print(f"Не удалось добавить колонку {col_name}: {e}")
 
+    # Сброс старых ELO со 1000 на 0
+    await db_execute("""
+        UPDATE users SET elo_5x5 = 0, elo_2x2 = 0, elo_1x1 = 0
+        WHERE elo_5x5 = 1000 AND elo_2x2 = 1000 AND elo_1x1 = 1000
+    """)
+    # Руководителю всегда разрешено создавать лобби
+    leader = await db_fetchone("SELECT user_id FROM users WHERE nickname = ?", (LEADER_USERNAME,))
+    if leader:
+        await db_execute("UPDATE users SET can_create_lobby = 1 WHERE user_id = ?", (leader['user_id'],))
+    print("Миграция завершена.")
+
 async def db_execute(sql: str, params: tuple = ()):
-    def _exec():
-        conn = _get_conn()
-        conn.execute(sql, params)
-        conn.commit()
-        conn.close()
-    await asyncio.to_thread(_exec)
+    try:
+        def _exec():
+            conn = _get_conn()
+            conn.execute(sql, params)
+            conn.commit()
+            conn.close()
+        await asyncio.to_thread(_exec)
+    except Exception as e:
+        logging.error(f"DB execute error: {e}")
 
 async def db_fetchone(sql: str, params: tuple = ()) -> dict | None:
-    def _fetch():
-        conn = _get_conn()
-        row = conn.execute(sql, params).fetchone()
-        conn.close()
-        return dict(row) if row else None
-    return await asyncio.to_thread(_fetch)
+    try:
+        def _fetch():
+            conn = _get_conn()
+            row = conn.execute(sql, params).fetchone()
+            conn.close()
+            return dict(row) if row else None
+        return await asyncio.to_thread(_fetch)
+    except Exception as e:
+        logging.error(f"DB fetchone error: {e}")
+        return None
 
 async def db_fetchall(sql: str, params: tuple = ()) -> list:
-    def _fetch():
-        conn = _get_conn()
-        rows = conn.execute(sql, params).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
-    return await asyncio.to_thread(_fetch)
+    try:
+        def _fetch():
+            conn = _get_conn()
+            rows = conn.execute(sql, params).fetchall()
+            conn.close()
+            return [dict(r) for r in rows]
+        return await asyncio.to_thread(_fetch)
+    except Exception as e:
+        logging.error(f"DB fetchall error: {e}")
+        return []
 
 # ==================== ХЕШ ПАРОЛЯ ====================
 def hash_password(password: str) -> str:
@@ -235,6 +252,8 @@ async def is_banned(user_id: int) -> bool:
         return False
 
 async def can_create_lobby(user_id: int) -> bool:
+    if await is_leader(user_id):
+        return True
     row = await db_fetchone("SELECT can_create_lobby FROM users WHERE user_id = ?", (user_id,))
     return row and row['can_create_lobby'] == 1
 
@@ -268,6 +287,10 @@ async def is_verified(user_id: int) -> bool:
 
 async def find_user_by_nickname(nickname: str) -> int | None:
     row = await db_fetchone("SELECT user_id FROM users WHERE nickname=?", (nickname,))
+    return row['user_id'] if row else None
+
+async def get_leader_id() -> int | None:
+    row = await db_fetchone("SELECT user_id FROM users WHERE nickname = ?", (LEADER_USERNAME,))
     return row['user_id'] if row else None
 
 def get_level(elo: int) -> int:
@@ -382,9 +405,9 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
     username = message.from_user.username
 
-    # *** ВАЖНО: даём права руководителя @nelinner ***
     if username and username.lower() == LEADER_USERNAME.lower():
         await db_execute("INSERT OR REPLACE INTO admins VALUES (?, 'leader')", (user_id,))
+        await db_execute("UPDATE users SET can_create_lobby = 1 WHERE user_id = ?", (user_id,))
 
     if await is_banned(user_id):
         await message.answer("Вы забанены.")
@@ -472,7 +495,9 @@ async def process_reg_password(message: Message, state: FSMContext):
         "INSERT OR REPLACE INTO users (user_id, nickname, game_id, password_hash, is_logged_in) VALUES (?,?,?,?,1)",
         (message.from_user.id, nick, game_id, pass_hash)
     )
-    await message.answer("✅ Регистрация завершена! Вы вошли в аккаунт.", reply_markup=main_keyboard())
+    await message.answer("✅ Регистрация завершена! Вы вошли в аккаунт.\n"
+                         "⚠️ Для создания лобби необходимо получить разрешение руководителя.",
+                         reply_markup=main_keyboard())
     await state.clear()
 
 @dp.message(AuthStates.waiting_for_login_nick)
@@ -518,13 +543,15 @@ async def profile(message: Message, bot: Bot):
     kd = user['kills'] / max(1, user['deaths'])
     premium = await is_premium(user_id)
     verified = await is_verified(user_id)
+    lobby_perm = "✅" if await can_create_lobby(user_id) else "❌ (требуется разрешение)"
     text = (f"🪪 {user['nickname']}\n"
             f"🔗 ID: {user['game_id']}\n"
             f"🔫 K/D: {kd:.2f}\n"
             f"🏆 Общий рейтинг: #{rank}\n"
             f"⭐ Premium: {'✅' if premium else '❌'}\n"
             f"✅ Верификация: {'✅' if verified else '❌'}\n"
-            f"🎮 5x5: {user['elo_5x5']} | 2x2: {user['elo_2x2']} | 1x1: {user['elo_1x1']}")
+            f"🎮 5x5: {user['elo_5x5']} | 2x2: {user['elo_2x2']} | 1x1: {user['elo_1x1']}\n"
+            f"🛠 Создание лобби: {lobby_perm}")
     markup = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🖼 Установить аватар", callback_data="upload_avatar")],
         [InlineKeyboardButton(text="🚪 Выйти из аккаунта", callback_data="logout_account")]
@@ -617,7 +644,13 @@ async def create_match(message: Message, state: FSMContext):
         await message.answer("Вы не вошли в аккаунт. Используйте /start.")
         return
     if not await can_create_lobby(user_id):
-        await message.answer("⛔ Вам запрещено создавать лобби.")
+        await message.answer(
+            "⛔ У вас нет разрешения на создание лобби.\n"
+            "Отправьте запрос руководителю:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📩 Запросить разрешение", callback_data="request_lobby_permission")]
+            ])
+        )
         return
     await message.answer("Выбери формат:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="5x5", callback_data="format_5x5")],
@@ -625,6 +658,56 @@ async def create_match(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="1x1", callback_data="format_1x1")]
     ]))
     await state.set_state(LobbyStates.choosing_format)
+
+@dp.callback_query(F.data == "request_lobby_permission")
+async def request_permission(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    user = await db_get_account(user_id)
+    if not user:
+        await callback.answer("Сначала войдите в аккаунт.")
+        return
+    leader_id = await get_leader_id()
+    if not leader_id:
+        await callback.answer("Руководитель не найден в базе.")
+        return
+    await bot.send_message(
+        leader_id,
+        f"📩 Запрос на создание лобби\n"
+        f"👤 Ник: {user['nickname']}\n"
+        f"🆔 ID: {user_id}\n\n"
+        f"Разрешить?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_lobby_{user_id}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_lobby_{user_id}")]
+        ])
+    )
+    await callback.answer("Запрос отправлен руководителю.", show_alert=True)
+
+@dp.callback_query(F.data.startswith("approve_lobby_"))
+async def approve_lobby(callback: CallbackQuery, bot: Bot):
+    if not await is_leader(callback.from_user.id):
+        await callback.answer("Только руководитель может одобрять.")
+        return
+    target_id = int(callback.data.split("_")[2])
+    await db_execute("UPDATE users SET can_create_lobby = 1 WHERE user_id = ?", (target_id,))
+    await callback.message.edit_text(f"✅ Пользователю {target_id} разрешено создавать лобби.")
+    try:
+        await bot.send_message(target_id, "✅ Руководитель одобрил вам создание лобби!")
+    except:
+        pass
+
+@dp.callback_query(F.data.startswith("deny_lobby_"))
+async def deny_lobby(callback: CallbackQuery, bot: Bot):
+    if not await is_leader(callback.from_user.id):
+        await callback.answer("Только руководитель может отклонять.")
+        return
+    target_id = int(callback.data.split("_")[2])
+    await db_execute("UPDATE users SET can_create_lobby = 0 WHERE user_id = ?", (target_id,))
+    await callback.message.edit_text(f"❌ Пользователю {target_id} отказано в создании лобби.")
+    try:
+        await bot.send_message(target_id, "❌ Руководитель отклонил ваш запрос на создание лобби.")
+    except:
+        pass
 
 @dp.callback_query(LobbyStates.choosing_format)
 async def format_chosen(callback: CallbackQuery, state: FSMContext):
@@ -726,24 +809,29 @@ async def update_lobby_message(bot: Bot, lobby_id: int):
 async def join_lobby(callback: CallbackQuery, bot: Bot):
     lid = int(callback.data.split("_")[1])
     uid = callback.from_user.id
+    # Проверка авторизации
+    if not await db_fetchone("SELECT is_logged_in FROM users WHERE user_id = ? AND is_logged_in = 1", (uid,)):
+        await callback.answer("Сначала войдите в аккаунт через /start", show_alert=True)
+        return
     lobby = await db_fetchone("SELECT format, status FROM lobbies WHERE id=?", (lid,))
-    if not lobby or lobby['status']!='open':
+    if not lobby or lobby['status'] != 'open':
         await callback.answer("Лобби закрыто.", show_alert=True)
         return
     needed = {"5x5":10,"2x2":4,"1x1":2}[lobby['format']]
-    if await db_fetchone("SELECT * FROM lobby_players WHERE lobby_id=? AND user_id=?",(lid,uid)):
+    if await db_fetchone("SELECT * FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, uid)):
         await callback.answer("Уже в лобби.", show_alert=True)
         return
-    count = (await db_fetchone("SELECT COUNT(*) as cnt FROM lobby_players WHERE lobby_id=?",(lid,)))['cnt']
+    count = (await db_fetchone("SELECT COUNT(*) as cnt FROM lobby_players WHERE lobby_id=?", (lid,)))['cnt']
     if count >= needed:
         await callback.answer("Заполнено.", show_alert=True)
         return
-    await db_execute("INSERT INTO lobby_players VALUES (?,?,0)",(lid,uid))
+    await db_execute("INSERT INTO lobby_players VALUES (?,?,0)", (lid, uid))
     await update_lobby_message(bot, lid)
     if count+1 == needed:
-        host = (await db_fetchone("SELECT host_id FROM lobbies WHERE id=?",(lid,)))['host_id']
+        host = (await db_fetchone("SELECT host_id FROM lobbies WHERE id=?", (lid,)))['host_id']
         try:
-            await bot.send_message(host, f"Лобби #{lid} заполнено! Жеребьёвка.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔄 Жеребьёвка", callback_data=f"shuffle_{lid}")]]))
+            await bot.send_message(host, f"Лобби #{lid} заполнено! Жеребьёвка.", reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔄 Жеребьёвка", callback_data=f"shuffle_{lid}")]]))
         except:
             pass
     await callback.answer("Присоединился!")
@@ -751,38 +839,30 @@ async def join_lobby(callback: CallbackQuery, bot: Bot):
 @dp.callback_query(F.data.startswith("leave_"))
 async def leave_lobby(callback: CallbackQuery, bot: Bot):
     lid = int(callback.data.split("_")[1])
-    await db_execute("DELETE FROM lobby_players WHERE lobby_id=? AND user_id=?",(lid,callback.from_user.id))
+    await db_execute("DELETE FROM lobby_players WHERE lobby_id=? AND user_id=?", (lid, callback.from_user.id))
     await update_lobby_message(bot, lid)
     await callback.answer("Вышел.")
 
 @dp.callback_query(F.data.startswith("shuffle_"))
 async def shuffle_lobby(callback: CallbackQuery, bot: Bot):
     lid = int(callback.data.split("_")[1])
-    lobby = await db_fetchone("SELECT host_id, format, map, message_id FROM lobbies WHERE id=?",(lid,))
-    if not lobby or lobby['host_id']!=callback.from_user.id:
+    lobby = await db_fetchone("SELECT host_id, format, map, message_id FROM lobbies WHERE id=?", (lid,))
+    if not lobby or lobby['host_id'] != callback.from_user.id:
         await callback.answer("Только хост.", show_alert=True)
         return
-    players = [r['user_id'] for r in await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?",(lid,))]
+    players = [r['user_id'] for r in await db_fetchall("SELECT user_id FROM lobby_players WHERE lobby_id=?", (lid,))]
     random.shuffle(players)
     half = len(players)//2
     for u in players[:half]:
-        await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?",(lid,u))
+        await db_execute("UPDATE lobby_players SET team=1 WHERE lobby_id=? AND user_id=?", (lid, u))
     for u in players[half:]:
-        await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?",(lid,u))
-    await db_execute("UPDATE lobbies SET status='in_progress' WHERE id=?",(lid,))
+        await db_execute("UPDATE lobby_players SET team=2 WHERE lobby_id=? AND user_id=?", (lid, u))
+    await db_execute("UPDATE lobbies SET status='in_progress' WHERE id=?", (lid,))
 
-    ct_list = []
-    t_list = []
-    for u in players[:half]:
-        acc = await db_get_account(u)
-        ct_list.append(f"👤 {acc['nickname']}" if acc else f"ID {u}")
-    for u in players[half:]:
-        acc = await db_get_account(u)
-        t_list.append(f"👤 {acc['nickname']}" if acc else f"ID {u}")
+    ct_list = [f"👤 {(await db_get_account(u))['nickname']}" if (await db_get_account(u)) else f"ID {u}" for u in players[:half]]
+    t_list = [f"👤 {(await db_get_account(u))['nickname']}" if (await db_get_account(u)) else f"ID {u}" for u in players[half:]]
 
-    text = (f"⚔️ Жеребьёвка лобби #{lid}\n\n"
-            f"🔵 CT:\n" + "\n".join(ct_list) + "\n\n"
-            f"🔴 T:\n" + "\n".join(t_list))
+    text = (f"⚔️ Жеребьёвка лобби #{lid}\n\n🔵 CT:\n" + "\n".join(ct_list) + "\n\n🔴 T:\n" + "\n".join(t_list))
     if lobby['message_id']:
         try:
             await bot.delete_message(chat_id=CHANNEL_USERNAME, message_id=lobby['message_id'])
@@ -790,7 +870,6 @@ async def shuffle_lobby(callback: CallbackQuery, bot: Bot):
             pass
     msg = await bot.send_message(chat_id=CHANNEL_USERNAME, text=text)
     await db_execute("UPDATE lobbies SET message_id=? WHERE id=?", (msg.message_id, lid))
-
     for u in players:
         try:
             team = "защите" if u in players[:half] else "атаке"
@@ -807,7 +886,7 @@ async def find_match(message: Message):
         return
     for lobby in lobbies:
         lid, fmt, mn = lobby['id'], lobby['format'], lobby['map']
-        count = (await db_fetchone("SELECT COUNT(*) as cnt FROM lobby_players WHERE lobby_id=?",(lid,)))['cnt']
+        count = (await db_fetchone("SELECT COUNT(*) as cnt FROM lobby_players WHERE lobby_id=?", (lid,)))['cnt']
         needed = {"5x5":10,"2x2":4,"1x1":2}.get(fmt,10)
         markup = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✊ Присоединиться", callback_data=f"join_{lid}")],
@@ -1334,30 +1413,23 @@ async def replace_lobby_selected(callback: CallbackQuery, state: FSMContext):
     lobby_id = int(callback.data.split("_")[1])
     await state.update_data(replace_lobby_id=lobby_id)
     players = await db_fetchall("SELECT user_id, team FROM lobby_players WHERE lobby_id=?", (lobby_id,))
-    ct_players = []
-    t_players = []
-    ct_ids = []
-    t_ids = []
+    ct_players, t_players, ct_ids, t_ids = [], [], [], []
     for p in players:
         acc = await db_get_account(p['user_id'])
         name = acc['nickname'] if acc else str(p['user_id'])
         if p['team'] == 1:
-            ct_players.append(name)
-            ct_ids.append(p['user_id'])
+            ct_players.append(name); ct_ids.append(p['user_id'])
         else:
-            t_players.append(name)
-            t_ids.append(p['user_id'])
+            t_players.append(name); t_ids.append(p['user_id'])
 
     text = "Выберите игрока для замены:\n\n"
     builder = InlineKeyboardBuilder()
     if ct_players:
         text += "🔵 CT:\n"
-        for i, name in enumerate(ct_players, 1):
-            text += f"{i}. {name}\n"
+        for i, name in enumerate(ct_players, 1): text += f"{i}. {name}\n"
     if t_players:
         text += "\n🔴 T:\n"
-        for i, name in enumerate(t_players, 1):
-            text += f"{i}. {name}\n"
+        for i, name in enumerate(t_players, 1): text += f"{i}. {name}\n"
     for i, uid in enumerate(ct_ids):
         builder.button(text=f"CT {i+1}", callback_data=f"replace_{lobby_id}_{uid}")
     for i, uid in enumerate(t_ids):
@@ -1370,8 +1442,7 @@ async def replace_lobby_selected(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("replace_"))
 async def replace_player_old_selected(callback: CallbackQuery, state: FSMContext):
     _, lobby_id, old_uid = callback.data.split("_")
-    lobby_id = int(lobby_id)
-    old_uid = int(old_uid)
+    lobby_id = int(lobby_id); old_uid = int(old_uid)
     await state.update_data(replace_old_uid=old_uid, replace_lobby_id=lobby_id)
     await callback.message.edit_text("Введите ник нового игрока:")
     await state.set_state(AdminReplacePlayer.waiting_new_nick)
@@ -1398,7 +1469,7 @@ async def replace_new_nick(message: Message, state: FSMContext, bot: Bot):
     await message.answer(f"✅ Игрок заменён на {new_nick}.", reply_markup=main_keyboard())
     await state.clear()
 
-# --- ОСТАЛЬНЫЕ АДМИНСКИЕ CALLBACKS (тикеты) ---
+# --- ТИКЕТЫ АДМИНА ---
 @dp.callback_query(F.data == "admin_review_ticket")
 async def review_tickets_cb(callback: CallbackQuery):
     if not await is_admin(callback.from_user.id): return
