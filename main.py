@@ -23,13 +23,13 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 from aiogram.client.session.aiohttp import AiohttpSession
 
 # ==================== КОНФИГУРАЦИЯ ====================
-BOT_TOKEN = "8254209430:AAE78X4Dli5kutcpFwEXJOXfEslx_GCJjuw"
+BOT_TOKEN = "8254209430:AAHrYF_5KJCA77-4nYpCaleisJckxUtCMLY"
 CHANNEL_USERNAME = "@hp404faceit"
 BOT_USERNAME = "@hp404bot"
 SHOP_BOT = "@hp404shopbot"
 CHAT_LINK = "https://t.me/hpfaceitchat"
 NEWS_CHANNEL = "@hp404news"
-LEADER_USERNAME = "nelinner"                  # ← руководитель
+LEADER_USERNAME = "nelinner"
 VERIFY_CHANNEL = "https://t.me/+wdNdSgYj86A2M2Uy"
 DB_NAME = "faceit.db"
 
@@ -114,21 +114,40 @@ def init_db():
     conn.close()
 
 async def run_migrations():
-    migrations = [
-        "ALTER TABLE users ADD COLUMN is_logged_in INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN premium_until TEXT",
-        "ALTER TABLE users ADD COLUMN premium INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN verified INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN matches_played INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN kills INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN deaths INTEGER DEFAULT 0",
-        "ALTER TABLE users ADD COLUMN avatar_file_id TEXT",
-    ]
-    for sql in migrations:
-        try:
-            await db_execute(sql)
-        except:
-            pass
+    # Эталонный список столбцов таблицы users (имя, тип)
+    expected_columns = {
+        "user_id": "INTEGER PRIMARY KEY",
+        "nickname": "TEXT UNIQUE",
+        "game_id": "TEXT",
+        "password_hash": "TEXT",
+        "is_logged_in": "INTEGER DEFAULT 0",
+        "elo_5x5": "INTEGER DEFAULT 1000",
+        "elo_2x2": "INTEGER DEFAULT 1000",
+        "elo_1x1": "INTEGER DEFAULT 1000",
+        "can_create_lobby": "INTEGER DEFAULT 1",
+        "premium_until": "TEXT",
+        "premium": "INTEGER DEFAULT 0",
+        "verified": "INTEGER DEFAULT 0",
+        "matches_played": "INTEGER DEFAULT 0",
+        "kills": "INTEGER DEFAULT 0",
+        "deaths": "INTEGER DEFAULT 0",
+        "avatar_file_id": "TEXT",
+    }
+
+    try:
+        existing_info = await db_fetchall("PRAGMA table_info(users)")
+        existing_columns = {row['name'] for row in existing_info}
+    except:
+        # Таблицы users ещё нет — ничего не делаем
+        return
+
+    for col_name, col_def in expected_columns.items():
+        if col_name not in existing_columns:
+            try:
+                await db_execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
+                print(f"Миграция: добавлена колонка {col_name}")
+            except Exception as e:
+                print(f"Не удалось добавить колонку {col_name}: {e}")
 
 async def db_execute(sql: str, params: tuple = ()):
     def _exec():
@@ -393,13 +412,14 @@ async def cmd_start(message: Message, state: FSMContext, bot: Bot):
 async def check_sub_callback(callback: CallbackQuery, state: FSMContext, bot: Bot):
     if await check_subscription(bot, callback.from_user.id):
         await callback.message.delete()
-        await start_registration(callback.message, state)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Зарегистрироваться", callback_data="auth_register")],
+            [InlineKeyboardButton(text="🔑 Войти", callback_data="auth_login")]
+        ])
+        await callback.message.answer(f"Добро пожаловать в {BOT_USERNAME}! Выберите действие:", reply_markup=markup)
+        await state.set_state(AuthStates.waiting_for_choice)
     else:
         await callback.answer("❌ Вы не подписаны!", show_alert=True)
-
-async def start_registration(message: Message, state: FSMContext):
-    await message.answer("Введи игровой ник:")
-    await state.set_state(RegStates.waiting_nickname)
 
 # --- АВТОРИЗАЦИЯ ---
 @dp.callback_query(AuthStates.waiting_for_choice, F.data == "auth_register")
@@ -418,7 +438,7 @@ async def process_reg_nick(message: Message, state: FSMContext):
     if len(nick) < 3:
         await message.answer("Ник должен быть не менее 3 символов.")
         return
-    if await is_nickname_similar(nick):
+    if await is_nickname_similar(nick, exclude_user_id=message.from_user.id):
         await message.answer("Этот ник (или похожий) уже занят.")
         return
     await state.update_data(reg_nick=nick)
@@ -930,7 +950,7 @@ async def player_desc(message: Message, state: FSMContext):
 
 @dp.message(TicketPlayerStates.from_nick)
 async def player_from(message: Message, state: FSMContext):
-    await state.update_data(from_nick=message.text); await message.answer("Прикрепи скриншот (или '-')"); await state.set_state(TicketPlayerStates.photo)
+    await state.update_data(from_nick=message.text); await message.answer("Прикрепи скриншот (или '-'):"); await state.set_state(TicketPlayerStates.photo)
 
 @dp.message(TicketPlayerStates.photo)
 async def player_photo(message: Message, state: FSMContext, bot: Bot):
