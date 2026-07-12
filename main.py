@@ -29,7 +29,7 @@ BOT_USERNAME = "@hp404bot"
 SHOP_BOT = "@hp404shopbot"
 CHAT_LINK = "https://t.me/hpfaceitchat"
 NEWS_CHANNEL = "@hp404news"
-LEADER_USERNAME = "nelinner"
+LEADER_USERNAME = "nelinner"                  # ← руководитель
 VERIFY_CHANNEL = "https://t.me/+wdNdSgYj86A2M2Uy"
 DB_NAME = "faceit.db"
 
@@ -361,6 +361,12 @@ dp = Dispatcher(storage=MemoryStorage())
 @dp.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
+    username = message.from_user.username
+
+    # *** ВАЖНО: даём права руководителя @nelinner ***
+    if username and username.lower() == LEADER_USERNAME.lower():
+        await db_execute("INSERT OR REPLACE INTO admins VALUES (?, 'leader')", (user_id,))
+
     if await is_banned(user_id):
         await message.answer("Вы забанены.")
         return
@@ -1324,18 +1330,14 @@ async def replace_lobby_selected(callback: CallbackQuery, state: FSMContext):
 
     text = "Выберите игрока для замены:\n\n"
     builder = InlineKeyboardBuilder()
-    idx = 0
     if ct_players:
         text += "🔵 CT:\n"
-        for name in ct_players:
-            idx += 1
-            text += f"{idx}. {name}\n"
+        for i, name in enumerate(ct_players, 1):
+            text += f"{i}. {name}\n"
     if t_players:
         text += "\n🔴 T:\n"
-        for name in t_players:
-            idx += 1
-            text += f"{idx}. {name}\n"
-    # Создаём кнопки для выбора
+        for i, name in enumerate(t_players, 1):
+            text += f"{i}. {name}\n"
     for i, uid in enumerate(ct_ids):
         builder.button(text=f"CT {i+1}", callback_data=f"replace_{lobby_id}_{uid}")
     for i, uid in enumerate(t_ids):
